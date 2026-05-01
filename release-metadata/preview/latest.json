@@ -1,0 +1,32 @@
+{
+  "latest_version": "2026.5.2-preview",
+  "releases": [
+    {
+      "version": "2026.5.2-preview",
+      "platform": "linux",
+      "arch": "x86_64",
+      "package_name": "memcore-cloud-2026.5.2-preview-linux-x86_64.tar.gz",
+      "checksum": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0,
+      "released_at": "2026-05-02T00:00:00.000000+00:00",
+      "type": "tar.gz",
+      "download_url": "https://example.invalid/memcore-cloud-2026.5.2-preview-linux-x86_64.tar.gz",
+      "note": "Dry-run metadata \u2014 artifact not published"
+    },
+    {
+      "version": "2026.5.2-preview",
+      "platform": "darwin",
+      "arch": "arm64",
+      "package_name": "memcore-cloud-2026.5.2-preview-darwin-arm64.zip",
+      "checksum": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0,
+      "released_at": "2026-05-02T00:00:00.000000+00:00",
+      "type": "zip",
+      "download_url": "https://example.invalid/memcore-cloud-2026.5.2-preview-darwin-arm64.zip",
+      "note": "Dry-run metadata \u2014 artifact not published"
+    }
+  ],
+  "generated_at": "2026-05-02T00:00:00.000000+00:00",
+  "dry_run": true,
+  "source": "P9-System-REL5 dry-run"
+}
