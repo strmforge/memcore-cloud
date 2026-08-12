@@ -23,6 +23,7 @@ RUNTIME_ENTRYPOINTS = (
     "single_port_runtime.py",
 )
 DIRECT_RUNTIME_ENTRYPOINTS = ("runtime/memcore-menu-bar",)
+TOOL_RUNTIME_ENTRYPOINTS = ("tools/codex_mcp_config_guard.py",)
 
 
 def _resolved(value: str | os.PathLike[str]) -> Path:
@@ -30,19 +31,23 @@ def _resolved(value: str | os.PathLike[str]) -> Path:
 
 
 def known_entrypoints(roots: Iterable[str | os.PathLike[str]]) -> set[Path]:
+    roots = tuple(root for root in roots if str(root or "").strip())
     script_entrypoints = {
         _resolved(root) / "src" / name
         for root in roots
-        if str(root or "").strip()
         for name in RUNTIME_ENTRYPOINTS
     }
     direct_entrypoints = {
         _resolved(root) / relative
         for root in roots
-        if str(root or "").strip()
         for relative in DIRECT_RUNTIME_ENTRYPOINTS
     }
-    return script_entrypoints | direct_entrypoints
+    tool_entrypoints = {
+        _resolved(root) / relative
+        for root in roots
+        for relative in TOOL_RUNTIME_ENTRYPOINTS
+    }
+    return script_entrypoints | direct_entrypoints | tool_entrypoints
 
 
 def _unwrap_env(argv: Sequence[str]) -> list[str]:

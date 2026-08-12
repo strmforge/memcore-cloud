@@ -21,7 +21,9 @@ import os
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,9 +33,25 @@ try:
 except ImportError:
     from raw_archive_layout import existing_or_preferred_raw_archive_path, preferred_raw_archive_path
 try:
-    from src.raw_archive_monotonic import append_source_file, latest_archive_segment, select_archive_segment
+    from src.raw_archive_monotonic import (
+        archive_generation_chain,
+        append_source_file,
+        cached_divergence_witness_visible,
+        latest_archive_segment,
+        load_generation_descriptor,
+        select_archive_segment,
+        select_archive_segment_metadata_only,
+    )
 except ImportError:
-    from raw_archive_monotonic import append_source_file, latest_archive_segment, select_archive_segment
+    from raw_archive_monotonic import (
+        archive_generation_chain,
+        append_source_file,
+        cached_divergence_witness_visible,
+        latest_archive_segment,
+        load_generation_descriptor,
+        select_archive_segment,
+        select_archive_segment_metadata_only,
+    )
 try:
     from src.window_binding_registry import register_current_window
 except ImportError:
@@ -59,9 +77,14 @@ DEFAULT_SYNC_INTERVAL_MS = 250
 MIN_SYNC_INTERVAL_MS = 50
 MAX_SYNC_INTERVAL_MS = 3_600_000
 DEFAULT_WATCH_SCAN_LIMIT = 8
+STATUS_SCAN_LIMIT = 20
 DEFAULT_TAIL_CATCHUP_BUDGET_MS = 900
 DEFAULT_TAIL_CATCHUP_MAX_PASSES = 6
 DEFAULT_RAW_LAG_SLA_MS = 1000
+DEFAULT_BACKFILL_RECOMMEND_AFTER_MS = 5000
+METADATA_DIVERGENCE_MAX_FILE_BYTES = 16 * 1024 * 1024
+METADATA_DIVERGENCE_CACHE_LIMIT = 256
+_METADATA_DIVERGENCE_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 
 
 def ts() -> str:
@@ -149,6 +172,10 @@ def watch_scan_limit() -> int:
     except Exception:
         value = DEFAULT_WATCH_SCAN_LIMIT
     return max(1, min(value, 200))
+
+
+def status_scan_limit() -> int:
+    return STATUS_SCAN_LIMIT
 
 
 def tail_catchup_budget_milliseconds() -> int:
@@ -358,19 +385,51 @@ def _session_id_from_path(path: Path, meta: dict) -> str:
         return sid
     stem = path.stem
     if stem.startswith("rollout-"):
+        match = re.match(
+            r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)$",
+            stem,
+        )
+        if match and match.group(1):
+            return match.group(1)
         parts = stem.split("-")
         if len(parts) >= 6:
             return "-".join(parts[-5:])
     return stem
 
 
+def _raw_archive_path_index() -> Dict[str, List[Path]]:
+    root = Path(memory_root())
+    candidates: Dict[str, List[Path]] = {}
+    patterns = (
+        "*/codex/codex_session_jsonl/*/*.jsonl",
+        "codex/*/*/*.jsonl",
+    )
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            if path.name.endswith(".canonical_dialogue.jsonl") or re.search(
+                r"\.seg\d+\.jsonl$", path.name
+            ):
+                continue
+            candidates.setdefault(path.stem, []).append(path)
+    return {
+        session_id: paths
+        for session_id, paths in candidates.items()
+        if paths
+    }
+
+
 def artifact_from_path(
     path: Path,
     index: Optional[Dict[str, dict]] = None,
     thread_index: Optional[Dict[str, Any]] = None,
+    raw_archive_index: Optional[Dict[str, List[Path]]] = None,
+    scan_mode: str = "full",
 ) -> dict:
     path = path.expanduser()
-    meta = _read_session_meta(path)
+    scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
+    meta = {} if scan_mode == "fast" else _read_session_meta(path)
     session_id = _session_id_from_path(path, meta)
     index = index if index is not None else _load_session_index()
     thread_index = thread_index if thread_index is not None else _load_state_thread_index()
@@ -379,7 +438,17 @@ def artifact_from_path(
     official_thread = thread_by_id.get(session_id) or thread_by_path.get(_path_key(path))
     indexed = index.get(session_id, {})
     cwd = _clean_path_text(meta.get("cwd") or (official_thread or {}).get("project_root") or indexed.get("cwd") or "")
-    project_id = project_id_from_cwd(cwd)
+    raw_candidates = (
+        list(raw_archive_index.get(session_id, []))
+        if isinstance(raw_archive_index, dict)
+        else []
+    )
+    raw_archive_path_hint = raw_candidates[0] if len(raw_candidates) == 1 else None
+    project_id = (
+        raw_archive_path_hint.parent.name
+        if not cwd and raw_archive_path_hint is not None
+        else project_id_from_cwd(cwd)
+    )
     stat = path.stat()
     mtime = datetime.fromtimestamp(stat.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
@@ -410,10 +479,21 @@ def artifact_from_path(
         "capture_classification": "SHADOW",
         "scope_level": "project",
         "read_only_probe": True,
+        "discovery_scan_mode": scan_mode,
+        "session_meta_body_read_performed": scan_mode == "full",
+        "raw_archive_path_hint": str(raw_archive_path_hint or ""),
+        "raw_archive_identity_status": (
+            "matched_unique"
+            if raw_archive_path_hint is not None
+            else "ambiguous"
+            if len(raw_candidates) > 1
+            else "not_indexed"
+        ),
     }
 
 
-def discover_sessions(limit: int = 0) -> List[dict]:
+def discover_sessions(limit: int = 0, scan_mode: str = "full") -> List[dict]:
+    scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
     root = codex_sessions_root()
     if not root.exists():
         return []
@@ -423,10 +503,19 @@ def discover_sessions(limit: int = 0) -> List[dict]:
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if limit and limit > 0:
         files = files[:limit]
+    raw_archive_index = _raw_archive_path_index() if scan_mode == "fast" else {}
     artifacts = []
     for path in files:
         try:
-            artifacts.append(artifact_from_path(path, index=index, thread_index=thread_index))
+            artifacts.append(
+                artifact_from_path(
+                    path,
+                    index=index,
+                    thread_index=thread_index,
+                    raw_archive_index=raw_archive_index,
+                    scan_mode=scan_mode,
+                )
+            )
         except OSError:
             continue
     return artifacts
@@ -505,7 +594,119 @@ def _epoch_ms_to_iso(value: int) -> str:
     return datetime.fromtimestamp(value / 1000.0, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _raw_sync_item(artifact: dict) -> dict:
+def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    )
+
+
+def _metadata_only_line_difference(source_record: Any, archive_record: Any) -> bool:
+    if not isinstance(source_record, dict) or not isinstance(archive_record, dict):
+        return False
+    source_payload = source_record.get("payload")
+    archive_payload = archive_record.get("payload")
+    if not isinstance(source_payload, dict) or not isinstance(archive_payload, dict):
+        return False
+    if "model_provider" not in source_payload or "model_provider" not in archive_payload:
+        return False
+    if source_payload.get("model_provider") == archive_payload.get("model_provider"):
+        return False
+    source_copy = dict(source_record)
+    archive_copy = dict(archive_record)
+    source_payload_copy = dict(source_payload)
+    archive_payload_copy = dict(archive_payload)
+    source_payload_copy.pop("model_provider", None)
+    archive_payload_copy.pop("model_provider", None)
+    source_copy["payload"] = source_payload_copy
+    archive_copy["payload"] = archive_payload_copy
+    return source_copy == archive_copy
+
+
+def _metadata_only_divergence_probe(source: Path, archive: Path) -> dict[str, Any]:
+    """Prove a bounded Codex rewrite changed only non-conversation metadata."""
+    source_identity = _file_identity(source)
+    archive_identity = _file_identity(archive)
+    base = {
+        "matched": False,
+        "status": "not_measured",
+        "metadata_only_fields": [],
+        "compared_line_count": 0,
+        "changed_line_count": 0,
+        "bytes_read": 0,
+    }
+    if source_identity is None or archive_identity is None:
+        return {**base, "status": "file_unavailable"}
+    cache_key = (*source_identity, *archive_identity)
+    cached = _METADATA_DIVERGENCE_CACHE.get(cache_key)
+    if cached is not None:
+        _METADATA_DIVERGENCE_CACHE.move_to_end(cache_key)
+        return {**cached, "cache_hit": True}
+    if max(source_identity[2], archive_identity[2]) > METADATA_DIVERGENCE_MAX_FILE_BYTES:
+        return {**base, "status": "byte_limit_exceeded"}
+
+    changed_line_count = 0
+    compared_line_count = 0
+    bytes_read = 0
+    status = "semantic_mismatch"
+    try:
+        with source.open("rb") as source_handle, archive.open("rb") as archive_handle:
+            for source_line, archive_line in zip_longest(source_handle, archive_handle):
+                if source_line is None or archive_line is None:
+                    status = "line_count_mismatch"
+                    break
+                compared_line_count += 1
+                bytes_read += len(source_line) + len(archive_line)
+                if source_line == archive_line:
+                    continue
+                try:
+                    source_record = json.loads(source_line.decode("utf-8"))
+                    archive_record = json.loads(archive_line.decode("utf-8"))
+                except Exception:
+                    status = "json_parse_failed"
+                    break
+                if not _metadata_only_line_difference(source_record, archive_record):
+                    status = "non_metadata_difference"
+                    break
+                changed_line_count += 1
+            else:
+                status = "metadata_only" if changed_line_count else "identical"
+    except OSError:
+        status = "read_error"
+
+    identities_stable = (
+        source_identity == _file_identity(source)
+        and archive_identity == _file_identity(archive)
+    )
+    matched = status == "metadata_only" and identities_stable
+    if not identities_stable:
+        status = "identity_changed_during_probe"
+    result = {
+        **base,
+        "matched": matched,
+        "status": status,
+        "metadata_only_fields": ["payload.model_provider"] if matched else [],
+        "compared_line_count": compared_line_count,
+        "changed_line_count": changed_line_count,
+        "bytes_read": bytes_read,
+        "cache_hit": False,
+    }
+    if identities_stable:
+        _METADATA_DIVERGENCE_CACHE[cache_key] = dict(result)
+        _METADATA_DIVERGENCE_CACHE.move_to_end(cache_key)
+        while len(_METADATA_DIVERGENCE_CACHE) > METADATA_DIVERGENCE_CACHE_LIMIT:
+            _METADATA_DIVERGENCE_CACHE.popitem(last=False)
+    return result
+
+
+def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
+    scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
     src = Path(artifact.get("source_path", "")).expanduser()
     src_stat = None
     observed_at_ms = int(time.time() * 1000)
@@ -514,32 +715,161 @@ def _raw_sync_item(artifact: dict) -> dict:
         source_size = src_stat.st_size
         source_mtime = datetime.fromtimestamp(src_stat.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except OSError:
+        src_stat = None
         source_size = 0
         source_mtime = artifact.get("mtime", "")
     base_dest = _raw_dest_for_artifact(artifact)
-    dest = (
-        select_archive_segment(base_dest, src_stat.st_ino)
-        if src_stat is not None
-        else latest_archive_segment(base_dest)
-    )
+    if scan_mode == "fast":
+        selection = select_archive_segment_metadata_only(
+            base_dest,
+            src_stat.st_ino if src_stat is not None else None,
+        )
+        selected_dest = Path(selection["archive_path"])
+        generation_blockers = [selection] if selection.get("generation_descriptor_incomplete") else []
+    else:
+        selection = {
+            "selection_status": "full_connector_selection",
+            "selection_proven_by_metadata": True,
+            "source_inode_match": True,
+            "body_read_performed": True,
+        }
+        generation_chain = archive_generation_chain(base_dest)
+        generation_blockers = [
+            item
+            for item in generation_chain
+            if item.get("pending_present")
+            or (item.get("descriptor_present") and not item.get("descriptor_valid"))
+        ]
+        selected_dest = (
+            select_archive_segment(base_dest, src_stat.st_ino, src)
+            if src_stat is not None
+            else latest_archive_segment(base_dest)
+        )
+    retained_dest = latest_archive_segment(base_dest)
+    metadata_divergence = {
+        "matched": False,
+        "status": "not_applicable",
+        "metadata_only_fields": [],
+    }
+    dest = selected_dest
+    generation_descriptor = load_generation_descriptor(dest)
+    generation_descriptor_incomplete = bool(generation_blockers)
+    if generation_descriptor_incomplete:
+        dest = Path(str(generation_blockers[-1].get("archive_path") or selected_dest))
+        generation_descriptor = {}
+    if (
+        scan_mode == "full"
+        and src_stat is not None
+        and not selected_dest.exists()
+        and retained_dest.exists()
+    ):
+        metadata_divergence = _metadata_only_divergence_probe(src, retained_dest)
+        if metadata_divergence.get("matched"):
+            dest = retained_dest
+            generation_descriptor = load_generation_descriptor(dest)
     dest_stat = None
     try:
         dest_stat = dest.stat()
-        raw_size = dest_stat.st_size
+        physical_raw_size = dest_stat.st_size
         raw_mtime = datetime.fromtimestamp(dest_stat.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     except OSError:
-        raw_size = 0
+        physical_raw_size = 0
         raw_mtime = ""
+    source_base_offset = int(generation_descriptor.get("source_base_offset", 0) or 0)
+    raw_covered_source_bytes = (
+        source_base_offset + physical_raw_size
+        if generation_descriptor
+        else physical_raw_size
+    )
+    raw_size = raw_covered_source_bytes
     missing = not dest.exists()
     overrun = bool(dest.exists()) and raw_size > source_size
     stale = bool(dest.exists()) and raw_size < source_size
     source_regression = overrun
-    source_divergence = False
     source_mtime_ms = _stat_mtime_ms(src_stat)
     raw_mtime_ms = _stat_mtime_ms(dest_stat)
     raw_mtime_gap_ms = max(0, source_mtime_ms - raw_mtime_ms) if stale and source_mtime_ms and raw_mtime_ms else 0
     lag_ms = max(0, observed_at_ms - source_mtime_ms) if stale and source_mtime_ms else 0
+    raw_size_delta_bytes = abs(source_size - raw_size)
     lag_bytes = max(0, source_size - raw_size)
+    generation_active = bool(generation_descriptor)
+    source_divergence = bool(metadata_divergence.get("matched"))
+    metadata_only_divergence = bool(metadata_divergence.get("matched"))
+    selection_meta = selection.get("metadata") if isinstance(selection.get("metadata"), dict) else {}
+    try:
+        metadata_offset = int(selection_meta.get("file_offset", -1))
+        metadata_mtime = float(selection_meta.get("source_mtime", -1.0))
+    except (TypeError, ValueError):
+        metadata_offset = -1
+        metadata_mtime = -1.0
+    metadata_continuity_proven = bool(
+        scan_mode == "full"
+        or generation_active
+        or (
+            src_stat is not None
+            and selection.get("source_inode_match")
+            and metadata_offset == source_size == raw_covered_source_bytes
+            and metadata_mtime == float(src_stat.st_mtime)
+        )
+    )
+    continuity_not_measured = bool(
+        scan_mode == "fast"
+        and not missing
+        and not generation_descriptor_incomplete
+        and not generation_active
+        and not metadata_continuity_proven
+    )
+    monotonic_probe_ok: bool | None = None if continuity_not_measured else not generation_descriptor_incomplete
+    monotonic_status = (
+        "raw_generation_descriptor_incomplete"
+        if generation_descriptor_incomplete
+        else "raw_continuity_not_measured_fast"
+        if continuity_not_measured
+        else "source_divergence_metadata_only_raw_retained"
+        if metadata_only_divergence
+        else "source_regression_raw_retained" if source_regression else ""
+    )
+    recommend_after_ms = max(DEFAULT_BACKFILL_RECOMMEND_AFTER_MS, raw_lag_sla_milliseconds() * 5)
+    if generation_descriptor_incomplete:
+        source_divergence = True
+        metadata_only_divergence = False
+    elif generation_active:
+        source_divergence = True
+        monotonic_status = "source_divergence_generation_active"
+        lag_ms = max(0, observed_at_ms - source_mtime_ms) if stale and source_mtime_ms else 0
+        lag_bytes = max(0, source_size - raw_covered_source_bytes)
+    elif metadata_only_divergence:
+        stale = False
+        overrun = False
+        source_regression = False
+        lag_ms = 0
+        lag_bytes = 0
+    elif scan_mode == "full" and raw_size and cached_divergence_witness_visible(src, dest, raw_size):
+        source_divergence = True
+        monotonic_status = "source_divergence_raw_retained"
+    elif scan_mode == "full" and stale and lag_ms > recommend_after_ms and src_stat is not None:
+        try:
+            monotonic_probe = append_source_file(
+                src,
+                base_dest,
+                dry_run=True,
+                source_inode=src_stat.st_ino,
+                continue_on_divergence=True,
+            )
+        except OSError:
+            monotonic_probe_ok = False
+            monotonic_status = "raw_monotonic_probe_incomplete"
+        else:
+            monotonic_status = str(monotonic_probe.get("status") or "")
+            source_divergence = bool(monotonic_probe.get("source_divergence"))
+            if source_divergence:
+                metadata_divergence = _metadata_only_divergence_probe(src, dest)
+                metadata_only_divergence = bool(metadata_divergence.get("matched"))
+                if metadata_only_divergence:
+                    monotonic_status = "source_divergence_metadata_only_raw_retained"
+                    stale = False
+                    lag_ms = 0
+                    lag_bytes = 0
     return {
         "session_id": artifact.get("session_id", ""),
         "project_id": artifact.get("project_id", ""),
@@ -552,6 +882,10 @@ def _raw_sync_item(artifact: dict) -> dict:
         "raw_mtime_ms": raw_mtime_ms,
         "raw_mtime_precise": _epoch_ms_to_iso(raw_mtime_ms),
         "raw_size_bytes": raw_size,
+        "raw_physical_size_bytes": physical_raw_size,
+        "raw_covered_source_bytes": raw_covered_source_bytes,
+        "raw_source_base_offset": source_base_offset,
+        "raw_path": str(dest),
         "raw_exists": dest.exists(),
         "raw_missing": missing,
         "raw_stale": stale,
@@ -559,9 +893,23 @@ def _raw_sync_item(artifact: dict) -> dict:
         "raw_rebuild_recommended": False,
         "raw_source_regression": source_regression,
         "raw_source_divergence": source_divergence,
-        "raw_monotonic_status": "source_regression_raw_retained" if source_regression else "",
+        "raw_metadata_only_divergence": metadata_only_divergence,
+        "raw_divergence_generation_active": generation_active,
+        "raw_generation_descriptor_incomplete": generation_descriptor_incomplete,
+        "raw_generation": int(generation_descriptor.get("generation", 0) or 0),
+        "raw_generation_predecessor": str(generation_descriptor.get("predecessor") or ""),
+        "metadata_only_fields": list(metadata_divergence.get("metadata_only_fields") or []),
+        "metadata_divergence_probe": metadata_divergence,
+        "raw_monotonic_status": monotonic_status,
+        "raw_monotonic_probe_ok": monotonic_probe_ok,
+        "raw_continuity_not_measured": continuity_not_measured,
+        "raw_continuity_evidence": str(selection.get("selection_status") or ""),
+        "raw_sync_scan_mode": scan_mode,
+        "raw_body_read_performed": bool(selection.get("body_read_performed")),
         "raw_archive_lag_bytes": lag_bytes,
+        "raw_size_delta_bytes": raw_size_delta_bytes,
         "raw_archive_lag_milliseconds": lag_ms,
+        "backfill_recommend_after_milliseconds": recommend_after_ms,
         "raw_source_mtime_gap_milliseconds": raw_mtime_gap_ms,
         "lag_observed_at_ms": observed_at_ms,
         "lag_observed_at": _epoch_ms_to_iso(observed_at_ms),
@@ -582,10 +930,24 @@ def raw_sync_snapshot(limit: int = 20) -> dict:
         item for item in items
         if (item.get("raw_missing") or item.get("raw_stale"))
         and not item.get("raw_source_regression")
-        and not item.get("raw_source_divergence")
+        and (
+            not item.get("raw_source_divergence")
+            or item.get("raw_divergence_generation_active")
+        )
     ]
     regression_items = [item for item in items if item.get("raw_source_regression")]
-    divergence_items = [item for item in items if item.get("raw_source_divergence")]
+    metadata_only_divergence_items = [
+        item for item in items if item.get("raw_metadata_only_divergence")
+    ]
+    divergence_items = [
+        item for item in items
+        if item.get("raw_source_divergence")
+        and not item.get("raw_metadata_only_divergence")
+        and not item.get("raw_divergence_generation_active")
+    ]
+    generation_items = [
+        item for item in items if item.get("raw_divergence_generation_active")
+    ]
     missing_items = [item for item in items if item.get("raw_missing")]
     lagging_items = [item for item in items if item.get("raw_stale")]
     max_lag_bytes = max((int(item.get("raw_archive_lag_bytes", 0) or 0) for item in lagging_items), default=0)
@@ -594,8 +956,34 @@ def raw_sync_snapshot(limit: int = 20) -> dict:
     sla_ms = raw_lag_sla_milliseconds()
     sla_breaches = [
         item for item in lagging_items
-        if int(item.get("raw_archive_lag_milliseconds", 0) or 0) > sla_ms
-        or (sla_ms == 0 and int(item.get("raw_archive_lag_bytes", 0) or 0) > 0)
+        if not item.get("raw_source_regression")
+        and (
+            not item.get("raw_source_divergence")
+            or item.get("raw_divergence_generation_active")
+        )
+        and item.get("raw_monotonic_probe_ok", True)
+        and (
+            int(item.get("raw_archive_lag_milliseconds", 0) or 0) > sla_ms
+            or (sla_ms == 0 and int(item.get("raw_archive_lag_bytes", 0) or 0) > 0)
+        )
+    ]
+    probe_incomplete_items = [
+        item for item in items
+        if item.get("raw_monotonic_probe_ok") is False
+    ]
+    catch_up_actionable_items = [
+        item for item in missing_or_stale
+        if item.get("raw_monotonic_probe_ok", True)
+    ]
+    catching_up_items = [
+        item for item in lagging_items
+        if not item.get("raw_source_regression")
+        and (
+            not item.get("raw_source_divergence")
+            or item.get("raw_divergence_generation_active")
+        )
+        and item.get("raw_monotonic_probe_ok", True)
+        and item not in sla_breaches
     ]
     source_epochs = [_iso_to_epoch(item.get("source_mtime", "")) for item in items]
     raw_epochs = [_iso_to_epoch(item.get("raw_mtime", "")) for item in items if item.get("raw_mtime")]
@@ -616,12 +1004,18 @@ def raw_sync_snapshot(limit: int = 20) -> dict:
         status_text = "raw_missing"
     elif regression_items:
         status_text = "source_regression_raw_retained"
+    elif probe_incomplete_items:
+        status_text = "raw_monotonic_probe_incomplete"
     elif divergence_items:
         status_text = "source_divergence_raw_retained"
     elif sla_breaches:
         status_text = "raw_lagging_sla_breach"
     elif missing_or_stale:
         status_text = "raw_catching_up"
+    elif metadata_only_divergence_items:
+        status_text = "raw_current_metadata_divergence_retained"
+    elif generation_items:
+        status_text = "raw_current_divergence_generation_active"
     else:
         status_text = "raw_current"
     return {
@@ -646,10 +1040,15 @@ def raw_sync_snapshot(limit: int = 20) -> dict:
         "raw_overrun_count": len(regression_items),
         "raw_source_regression_count": len(regression_items),
         "raw_source_divergence_count": len(divergence_items),
+        "raw_metadata_only_divergence_count": len(metadata_only_divergence_items),
+        "raw_divergence_generation_active_count": len(generation_items),
+        "raw_monotonic_probe_incomplete_count": len(probe_incomplete_items),
         "raw_rebuild_recommended_count": 0,
-        "raw_catching_up_count": len(lagging_items) - len(sla_breaches),
+        "raw_catching_up_count": len(catching_up_items),
+        "raw_catch_up_actionable_count": len(catch_up_actionable_items),
         "missing_or_stale_count": len(missing_or_stale) + len(regression_items) + len(divergence_items),
         "latest_missing_or_stale": (regression_items + divergence_items + missing_or_stale)[:5],
+        "latest_metadata_only_divergence": metadata_only_divergence_items[:5],
     }
 
 
@@ -675,7 +1074,15 @@ def catch_up_latest_sessions(
         changed += int(result.get("changed", 0) or 0)
         items.extend(result.get("items", []))
         final_snapshot = raw_sync_snapshot(limit=scan_limit)
-        if final_snapshot.get("missing_or_stale_count", 0) == 0:
+        actionable = final_snapshot.get("raw_catch_up_actionable_count")
+        if actionable is None:
+            terminal = sum(int(final_snapshot.get(key, 0) or 0) for key in (
+                "raw_source_regression_count",
+                "raw_source_divergence_count",
+                "raw_monotonic_probe_incomplete_count",
+            ))
+            actionable = max(0, int(final_snapshot.get("missing_or_stale_count", 0) or 0) - terminal)
+        if int(actionable or 0) == 0:
             break
         if time.monotonic() >= deadline:
             break
@@ -736,6 +1143,14 @@ def _raw_dest_for_artifact(artifact: dict) -> Path:
     project_id = _safe_segment(artifact.get("canonical_window_id") or artifact.get("project_id"), "project")
     session_id = _safe_segment(artifact.get("session_id"), "session")
     root = memory_root()
+    hinted = Path(str(artifact.get("raw_archive_path_hint") or "")).expanduser()
+    if str(hinted) not in {"", "."} and hinted.is_file():
+        try:
+            hinted.resolve().relative_to(Path(root).resolve())
+        except (OSError, ValueError):
+            pass
+        else:
+            return hinted
     preferred = preferred_raw_archive_path(
         root,
         computer_name=artifact.get("computer_name") or node_id(),
@@ -747,7 +1162,20 @@ def _raw_dest_for_artifact(artifact: dict) -> Path:
     return existing_or_preferred_raw_archive_path(root, preferred)
 
 
+def _generation_meta(dest: Path) -> dict[str, Any]:
+    descriptor = load_generation_descriptor(dest)
+    return {
+        "raw_generation_contract": descriptor.get("contract", ""),
+        "raw_generation": int(descriptor.get("generation", 0) or 0),
+        "source_base_offset": int(descriptor.get("source_base_offset", 0) or 0),
+        "raw_generation_predecessor": str(descriptor.get("predecessor") or ""),
+        "raw_generation_reason": str(descriptor.get("reason") or ""),
+        "raw_generation_descriptor_path": str(Path(str(dest) + ".generation.json")) if descriptor else "",
+    }
+
+
 def _write_meta(dest: Path, artifact: dict, src_stat: os.stat_result, offset: int, raw_order: int) -> None:
+    generation_meta = _generation_meta(dest)
     meta = {
         "source_system": SOURCE_SYSTEM,
         "source_path": artifact.get("source_path", ""),
@@ -767,6 +1195,7 @@ def _write_meta(dest: Path, artifact: dict, src_stat: os.stat_result, offset: in
         "forensic_runtime_storage": "full_raw_archive_plus_manifest",
         "canonical_dialogue_path": str(dest) + ".canonical_dialogue.jsonl",
         "forensic_runtime_manifest_path": str(dest) + ".forensic_runtime.json",
+        **generation_meta,
         "last_update": ts(),
     }
     with open(str(dest) + ".meta.json", "w", encoding="utf-8") as f:
@@ -799,6 +1228,7 @@ def _meta_needs_update(dest: Path, artifact: dict, src_stat: os.stat_result, off
         "forensic_runtime_storage": "full_raw_archive_plus_manifest",
         "canonical_dialogue_path": str(dest) + ".canonical_dialogue.jsonl",
         "forensic_runtime_manifest_path": str(dest) + ".forensic_runtime.json",
+        **_generation_meta(dest),
     }
     for key, value in wanted.items():
         if existing.get(key) != value:
@@ -841,7 +1271,7 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
     try:
         src_stat = src.stat()
     except OSError:
-        report = append_source_file(src, base_dest, dry_run=dry_run)
+        report = append_source_file(src, base_dest, dry_run=dry_run, compute_sha256=False)
         if report.get("source_regression"):
             return str(report.get("archive_path") or base_dest), (
                 "source_regression_raw_retained("
@@ -858,21 +1288,41 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
         base_dest,
         dry_run=dry_run,
         source_inode=src_stat.st_ino,
+        compute_sha256=False,
+        continue_on_divergence=True,
     )
     dest = Path(str(report.get("archive_path") or base_dest))
-    if prior and int(prior.get("source_inode", 0) or 0) not in {0, src_stat.st_ino}:
+    if (
+        prior
+        and int(prior.get("source_inode", 0) or 0) not in {0, src_stat.st_ino}
+        and not report.get("source_identity_rebound")
+    ):
         raw_order += 1
     report_status = str(report.get("status") or "")
+    if report.get("generation_started"):
+        raw_order = max(raw_order + 1, int(report.get("generation", 0) or 0) + 1)
 
+    generation_started = bool(report.get("generation_started"))
+    generation_active = bool(report.get("generation_active") or generation_started)
+    if report_status == "source_divergence_generation_fail_closed":
+        return str(dest), (
+            "source_divergence_generation_fail_closed("
+            f"reason={report.get('generation_failure', 'unknown')})"
+        )
     if report.get("source_regression"):
         return str(dest), (
             "source_regression_raw_retained("
             f"source={report.get('source_size', 0)},raw={report.get('archive_size_before', 0)})"
         )
-    if report.get("source_divergence"):
+    if report.get("source_divergence") and not generation_active:
         return str(dest), (
             "source_divergence_raw_retained("
             f"source={report.get('source_size', 0)},raw={report.get('archive_size_before', 0)})"
+        )
+    if report_status == "waiting_for_complete_jsonl_line":
+        return str(dest), (
+            "generation_waiting_for_complete_jsonl_line("
+            f"covered={report.get('source_covered_bytes', 0)},source={report.get('source_size', 0)})"
         )
     if dry_run:
         return str(dest), (
@@ -880,13 +1330,17 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
             f"raw={report.get('archive_size_before', 0)},source={src_stat.st_size})"
         )
 
+    covered_offset = int(report.get("source_covered_bytes", src_stat.st_size) or 0)
     checkpoint[key] = {
-        "offset": src_stat.st_size,
+        "offset": covered_offset,
         "archived_to": str(dest),
         "source_inode": src_stat.st_ino,
         "source_size": src_stat.st_size,
         "source_mtime": src_stat.st_mtime,
         "raw_order": raw_order,
+        "generation": int(report.get("generation") or load_generation_descriptor(dest).get("generation", 0) or 0),
+        "source_base_offset": int(report.get("source_base_offset") or load_generation_descriptor(dest).get("source_base_offset", 0) or 0),
+        "predecessor": str(report.get("predecessor") or load_generation_descriptor(dest).get("predecessor") or ""),
         "source_system": SOURCE_SYSTEM,
         "last_update": ts(),
         "raw_archive_contract": report.get("contract", ""),
@@ -896,7 +1350,7 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
     dialogue_path = canonical_dialogue_sidecar_path(dest)
     forensic_path = forensic_runtime_manifest_path(dest)
     if (
-        report_status in {"created", "appended"}
+        report_status in {"created", "appended", "source_divergence_generation_started", "appended_generation"}
         or not dialogue_path.exists()
         or not forensic_path.exists()
     ):
@@ -906,8 +1360,12 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
             session_id=str(artifact.get("session_id") or ""),
             canonical_window_id=str(artifact.get("canonical_window_id") or ""),
             native_artifact_format=artifact.get("artifact_type") or NATIVE_ARTIFACT_FORMAT,
-            reset=report_status == "created",
+            reset=report_status in {"created", "source_divergence_generation_started"},
             raw_order=raw_order,
+            native_source_path=str(src),
+            source_base_offset=int(report.get("source_base_offset") or load_generation_descriptor(dest).get("source_base_offset", 0) or 0),
+            generation=int(report.get("generation") or load_generation_descriptor(dest).get("generation", 0) or 0),
+            predecessor=str(report.get("predecessor") or load_generation_descriptor(dest).get("predecessor") or ""),
         )
     if report_status == "up_to_date":
         if _meta_needs_update(dest, artifact, src_stat, src_stat.st_size, raw_order):
@@ -917,11 +1375,21 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
             return str(dest), f"up_to_date(offset={src_stat.st_size}, checkpoint_recovered)"
         return str(dest), f"up_to_date(offset={src_stat.st_size})"
 
-    _write_meta(dest, artifact, src_stat, src_stat.st_size, raw_order)
+    _write_meta(dest, artifact, src_stat, covered_offset, raw_order)
     lines_written = int(report.get("lines_appended") or 0)
     bytes_written = int(report.get("bytes_appended") or 0)
     if report_status == "created":
         return str(dest), f"archived({lines_written} lines, {bytes_written} bytes)"
+    if report_status == "source_divergence_generation_started":
+        return str(dest), (
+            f"generation_started(generation={report.get('generation', 0)},"
+            f"base={report.get('source_base_offset', 0)},bytes={bytes_written})"
+        )
+    if report_status == "appended_generation":
+        return str(dest), (
+            f"appended_generation({lines_written} lines, {bytes_written} bytes,"
+            f"{report.get('archive_size_before', 0)}->{report.get('archive_size_after', 0)})"
+        )
     return str(dest), (
         f"appended({lines_written} lines, {bytes_written} bytes, "
         f"{report.get('archive_size_before', 0)}->{report.get('archive_size_after', 0)})"
@@ -938,7 +1406,7 @@ def scan_sessions(dry_run: bool = False, limit: int = 0, public: bool = False) -
     current_window_registered = False
     for artifact in artifacts:
         dest, status = archive_session_incremental(artifact["source_path"], dry_run=dry_run, artifact=artifact)
-        changed_status = status.startswith(("archived", "appended", "rotation", "rebuilt", "metadata_updated"))
+        changed_status = status.startswith(("archived", "appended", "generation_started", "rotation", "rebuilt", "metadata_updated"))
         if dry_run and status.startswith("dry_run"):
             would_change += 1
         elif changed_status:
@@ -975,10 +1443,11 @@ def scan_sessions(dry_run: bool = False, limit: int = 0, public: bool = False) -
 
 
 def status() -> dict:
-    artifacts = discover_sessions(limit=20)
+    scan_limit = status_scan_limit()
+    artifacts = discover_sessions(limit=scan_limit)
     state_index = _load_state_thread_index()
     interval_ms = watcher_interval_milliseconds()
-    raw_sync = raw_sync_snapshot(limit=20)
+    raw_sync = raw_sync_snapshot(limit=scan_limit)
     return {
         "ok": True,
         "source_system": SOURCE_SYSTEM,

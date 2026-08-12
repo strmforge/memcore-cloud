@@ -23,6 +23,7 @@ RUN_SMOKE=1
 RUNTIME_PYTHON=""
 CODEX_SKILL_STATUS="pending"
 CODEX_MCP_STATUS="pending"
+CODEX_MCP_GUARD_STATUS="pending"
 CLAUDE_CODE_MCP_STATUS="pending"
 CLAUDE_CODE_HOOK_STATUS="pending"
 CLAUDE_DESKTOP_STATUS="pending"
@@ -421,7 +422,8 @@ current_service_names() {
     time-library-p6-console.service \
     time-library-raw-gateway.service \
     time-library-dialog-entry.service \
-    time-library-front-door.service
+    time-library-front-door.service \
+    time-library-codex-mcp-guard.service
 }
 
 legacy_service_names() {
@@ -631,6 +633,8 @@ write_config() {
     cp "${INSTALL_ROOT}/config/default_feature_flags.json" "${INSTALL_ROOT}/config/feature_flags.json"
   [[ -f "${INSTALL_ROOT}/config/alias_map.json" || ! -f "${INSTALL_ROOT}/config/default_alias_map.json" ]] || \
     cp "${INSTALL_ROOT}/config/default_alias_map.json" "${INSTALL_ROOT}/config/alias_map.json"
+  [[ -f "${INSTALL_ROOT}/config/window_binding_registry.json" || ! -f "${INSTALL_ROOT}/config/default_window_binding_registry.json" ]] || \
+    cp "${INSTALL_ROOT}/config/default_window_binding_registry.json" "${INSTALL_ROOT}/config/window_binding_registry.json"
 
   python3 - "$INSTALL_ROOT" "$(node_name)" "$DIALOG_ENTRY_HOST" "$DIALOG_ENTRY_ENDPOINT_URL" <<'PY'
 import json
@@ -775,7 +779,12 @@ install_python_env() {
     RUNTIME_VENV_BUILD=""
     python3 - <<'PY'
 import importlib.util
-missing = [name for name in ("cryptography", "yaml") if importlib.util.find_spec(name) is None]
+import sys
+
+required = ["cryptography", "yaml"]
+if sys.version_info < (3, 11):
+    required.append("tomli")
+missing = [name for name in required if importlib.util.find_spec(name) is None]
 if missing:
     raise SystemExit("system python missing packages: " + ", ".join(missing))
 PY
@@ -854,6 +863,7 @@ install_user_services() {
     "$py" "${INSTALL_ROOT}/src/dialog_entry_proxy.py" --host 127.0.0.1 --port "$INTERNAL_DIALOG_PORT"
   write_systemd_service time-library-front-door.service front-door \
     "$py" "${INSTALL_ROOT}/src/single_port_runtime.py" --host 127.0.0.1 --preferred-port "$FRONT_DOOR_PORT"
+  install_codex_mcp_guard_service
 }
 
 start_user_services() {
@@ -872,6 +882,9 @@ start_user_services() {
     systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
   done < <(legacy_service_names)
   while IFS= read -r unit; do
+    if [[ "$unit" == "time-library-codex-mcp-guard.service" && ! -f "${SYSTEMD_USER_DIR}/${unit}" ]]; then
+      continue
+    fi
     systemctl --user enable --now "$unit" >/dev/null
   done < <(current_service_names)
 }
@@ -1079,45 +1092,66 @@ install_codex_skill() {
 install_codex_mcp() {
   if [[ "$SKIP_CODEX" == "1" ]]; then
     CODEX_MCP_STATUS="skipped"
-    return
-  fi
-  local codex_exe
-  if ! codex_exe="$(find_codex_cli)"; then
-    warn "Codex CLI not found; skipping Codex MCP registration"
-    CODEX_MCP_STATUS="codex CLI not found"
+    CODEX_MCP_GUARD_STATUS="skipped"
     return
   fi
   local bridge="${INSTALL_ROOT}/tools/codex_mcp_bridge.py"
-  local policy_helper="${INSTALL_ROOT}/tools/configure_codex_mcp_policy.py"
-  local registry_path="${INSTALL_ROOT}/config/window_binding_registry.json"
+  local guard="${INSTALL_ROOT}/tools/codex_mcp_config_guard.py"
+  local config_path="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+  local guard_python="${RUNTIME_PYTHON:-${INSTALL_ROOT}/.venv/bin/python}"
+  [[ -x "$guard_python" ]] || guard_python="$(command -v python3)"
+  local codex_exe=""
+  if [[ ! -f "$config_path" ]] && ! codex_exe="$(find_codex_cli)"; then
+    warn "Codex CLI/config not found; skipping Codex MCP registration and guard"
+    CODEX_MCP_STATUS="Codex not detected"
+    CODEX_MCP_GUARD_STATUS="Codex not detected"
+    return
+  fi
   if [[ ! -f "$bridge" ]]; then
     warn "Codex MCP bridge not found: ${bridge}"
     CODEX_MCP_STATUS="bridge not found"
+    CODEX_MCP_GUARD_STATUS="bridge not found"
     return
   fi
-  "$codex_exe" mcp remove time-library >/dev/null 2>&1 || true
-  if "$codex_exe" mcp add time-library \
-    --env "PYTHONIOENCODING=utf-8" \
-    --env "PYTHONUTF8=1" \
-    --env "MEMCORE_ROOT=${INSTALL_ROOT}" \
-    --env "MEMCORE_WINDOW_BINDING_REGISTRY=${registry_path}" \
-    -- python3 "$bridge" \
-      --timeout 30 \
-      --window-binding-registry "$registry_path" \
-      --binding-key codex >/dev/null 2>&1; then
-    local policy_python="${RUNTIME_PYTHON:-$(command -v python3)}"
-    if [[ -f "$policy_helper" ]] && "$policy_python" "$policy_helper" \
-      --config "${CODEX_HOME:-${HOME}/.codex}/config.toml" >/dev/null 2>&1; then
-      log "Codex MCP registered with scoped recall/ack approval: time-library via ${bridge}"
-      CODEX_MCP_STATUS="time-library"
-    else
-      warn "Codex MCP registered, but scoped recall/ack approval policy could not be applied"
-      CODEX_MCP_STATUS="time-library (approval policy warning)"
-    fi
-  else
-    warn "Codex MCP registration failed; Codex users can run: codex mcp add time-library -- python3 ${bridge}"
-    CODEX_MCP_STATUS="registration failed"
+  if [[ ! -f "$guard" ]]; then
+    warn "Codex MCP config guard not found: ${guard}"
+    CODEX_MCP_STATUS="guard not found"
+    CODEX_MCP_GUARD_STATUS="guard not found"
+    return
   fi
+  if "$guard_python" "$guard" \
+    --once \
+    --config "$config_path" \
+    --install-root "$INSTALL_ROOT" \
+    --python-executable "$guard_python" \
+    --create-if-missing >/dev/null 2>&1; then
+    CODEX_MCP_GUARD_STATUS="installed"
+    log "Codex MCP registered with protected relay-preserving guard: time-library via ${bridge}"
+    CODEX_MCP_STATUS="time-library (guarded)"
+  else
+    warn "Codex MCP registration failed; existing host configuration and guard were left unchanged"
+    CODEX_MCP_STATUS="registration failed"
+    CODEX_MCP_GUARD_STATUS="registration failed"
+  fi
+}
+
+install_codex_mcp_guard_service() {
+  local unit="time-library-codex-mcp-guard.service"
+  if [[ "$CODEX_MCP_GUARD_STATUS" != "installed" ]]; then
+    # Do not remove an existing guard when this installation cannot refresh
+    # the host stanza.  A failed/ skipped registration must retain protection;
+    # an explicit uninstall is the only path that removes the service.
+    log "Codex MCP config guard unchanged: ${CODEX_MCP_GUARD_STATUS}"
+    return 0
+  fi
+  local py="${RUNTIME_PYTHON:-${INSTALL_ROOT}/.venv/bin/python}"
+  local config_path="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+  local guard="${INSTALL_ROOT}/tools/codex_mcp_config_guard.py"
+  write_systemd_service "$unit" codex-mcp-guard \
+    "$py" "$guard" --watch \
+    --config "$config_path" \
+    --install-root "$INSTALL_ROOT" \
+    --python-executable "$py"
 }
 
 install_claude_code_preflight_hook() {
@@ -1469,6 +1503,7 @@ else
   log "Host integrations and systemd user definitions preserved by --no-start staging mode"
   CODEX_SKILL_STATUS="skipped (--no-start)"
   CODEX_MCP_STATUS="skipped (--no-start)"
+  CODEX_MCP_GUARD_STATUS="skipped (--no-start)"
   CLAUDE_CODE_MCP_STATUS="skipped (--no-start)"
   CLAUDE_CODE_HOOK_STATUS="skipped (--no-start)"
   CLAUDE_DESKTOP_STATUS="skipped (--no-start)"
@@ -1489,6 +1524,7 @@ Hermes memory provider: $([[ "$SKIP_START" == "1" || "$SKIP_HERMES" == "1" ]] &&
 Hermes skill: $([[ "$SKIP_START" == "1" || "$SKIP_HERMES" == "1" ]] && echo skipped || echo time-library)
 Codex skill: ${CODEX_SKILL_STATUS}
 Codex MCP: ${CODEX_MCP_STATUS}
+Codex MCP config guard: ${CODEX_MCP_GUARD_STATUS}
 Claude Code MCP: ${CLAUDE_CODE_MCP_STATUS}
 Claude Code preflight hook: ${CLAUDE_CODE_HOOK_STATUS}
 Claude Desktop MCP: ${CLAUDE_DESKTOP_STATUS}

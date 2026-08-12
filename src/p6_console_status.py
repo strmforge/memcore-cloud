@@ -25,9 +25,10 @@ except Exception:
     from config_loader import base_path
 try:
     from src.service_manager import get_service_manager
+    from src.raw_record_recoverability import lost_source_triage
 except Exception:
     from service_manager import get_service_manager
-
+    from raw_record_recoverability import lost_source_triage
 TIANDAO_CONSOLE_STATUS_CONTRACT = "tiandao_console_status_diagnostics.v1"
 MEMCORE_ROOT = base_path()
 
@@ -606,11 +607,12 @@ def m3_get_audit_risks():
             public=True,
         )
         summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+        summary_scope = report.get("summary_scope") if isinstance(report.get("summary_scope"), dict) else {}
         risks = []
+        _, _, lost_source_unrecoverable, lost_source_not_measured = lost_source_triage(summary)
         checks = (
             ("lost_raw", "lost_raw_count", "HIGH"),
             ("corrupt_record", "corrupt_record_count", "HIGH"),
-            ("lost_source", "lost_source_count", "MEDIUM"),
             ("raw_attention", "raw_attention_count", "MEDIUM"),
         )
         for risk_type, field, severity in checks:
@@ -622,15 +624,22 @@ def m3_get_audit_risks():
                     "status": "attention",
                     "severity": severity,
                 })
+        if lost_source_unrecoverable:
+            risks.append({"type": "lost_source", "recoverability": "measured_unrecoverable", "count": lost_source_unrecoverable, "status": "attention", "severity": "MEDIUM"})
         measured = bool(summary)
+        evidence_gaps = ([{"type": "lost_source_recoverability_not_measured", "count": lost_source_not_measured, "status": "observe"}] if lost_source_not_measured else [])
+        if summary_scope.get("summary_is_sample"):
+            evidence_gaps.append({"type": "guardian_summary_population_incomplete", "count": 1, "status": "observe"})
         return {
             "risks": risks,
             "total_risks": len(risks),
             "audit1_pass": measured and not any(
                 item.get("severity") in {"CRITICAL", "HIGH"} for item in risks
             ),
-            "evidence_status": "measured" if measured else "not_measured",
+            "evidence_status": "partial" if evidence_gaps else ("measured" if measured else "not_measured"),
+            "evidence_gaps": evidence_gaps,
             "guardian_summary": summary,
+            "guardian_summary_scope": summary_scope,
         }
     except Exception as e:
         return {

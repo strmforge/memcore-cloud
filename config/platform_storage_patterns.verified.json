@@ -121,7 +121,7 @@
       "auto_connect": {
         "mcp": true,
         "skill": true,
-        "preferred_apply": "codex mcp add time-library -- python3 <install-root>/tools/codex_mcp_bridge.py"
+        "preferred_apply": "run the installed Time Library Codex MCP guard once; it performs a narrow merge and never performs a whole-file CLI rewrite"
       },
       "verified_storage_patterns": [
         {

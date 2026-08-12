@@ -30,6 +30,7 @@ def query_raw_source_refs_impl(
     recall_mode: str = '',
     fts5_recall: bool = False,
     binding_identity: Optional[str] = None,
+    expand_catalog_raw: bool = False,
 ) -> Dict[str, Any]:
     ACTIVE_RECALL_CANDIDATE_MAX = namespace["ACTIVE_RECALL_CANDIDATE_MAX"]
     MAX_EXCERPT = namespace["MAX_EXCERPT"]
@@ -98,6 +99,7 @@ def query_raw_source_refs_impl(
         raise ValueError("invalid_fast_preflight_miss_policy")
     recall_mode = _clean_text(recall_mode)
     fts5_recall = _truthy(fts5_recall)
+    expand_catalog_raw = _truthy(expand_catalog_raw)
     recall_mode_explicit = bool(recall_mode)
     fts5_recall_explicit = bool(fts5_recall)
     default_recall_preference = _load_default_recall_preference()
@@ -228,6 +230,29 @@ def query_raw_source_refs_impl(
     )
     fast_preflight_telemetry: Dict[str, Any] = {}
 
+    def expand_catalog_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        if not expand_catalog_raw or str(item.get("raw_evidence_status") or "") != "raw_index":
+            return item
+        expanded = dict(item)
+        msg_ids = [str(msg_id) for msg_id in (expanded.get("msg_ids") or []) if str(msg_id)]
+        source_refs = dict(expanded)
+        offsets = expanded.get("byte_offsets") if isinstance(expanded.get("byte_offsets"), dict) else {}
+        if "start" in offsets and "end" in offsets and msg_ids:
+            source_refs["byte_offsets"] = {msg_ids[0]: offsets}
+        excerpt, status, evidence_hash = _extract_bounded_raw_excerpt(
+            str(expanded.get("source_path") or ""),
+            msg_ids,
+            excerpt_chars,
+            source_refs,
+        )
+        expanded["raw_excerpt"] = excerpt
+        expanded["raw_evidence_status"] = status if excerpt else "raw_index"
+        expanded["raw_expand_status"] = status
+        expanded["raw_expand_from_catalog_index"] = bool(excerpt)
+        if evidence_hash:
+            expanded["evidence_hash"] = evidence_hash
+        return expanded
+
     if scope["scope_missing"]:
         scope_status = _scope_missing_status(scope)
         injection_boundary = 'window_scope_required_for_default_recall'
@@ -322,6 +347,7 @@ def query_raw_source_refs_impl(
                 excerpt_chars=excerpt_chars,
                 allow_recent_context=_preflight_recent_context_allowed(query or ''),
             )
+            source_items = [expand_catalog_item(item) for item in source_items]
             index_statuses.append(f"{source_filter or 'all'}:{index_status}")
             indexed_items.extend(source_items)
             if len(indexed_items) >= limit:
@@ -916,6 +942,7 @@ def query_raw_source_refs_impl(
                     excerpt_chars=excerpt_chars,
                     allow_recent_context=False,
                 )
+                indexed_items = [expand_catalog_item(item) for item in indexed_items]
                 catalog_statuses.append(f"{source_filter or 'all'}:{index_status}")
                 for indexed_item in indexed_items:
                     key = (

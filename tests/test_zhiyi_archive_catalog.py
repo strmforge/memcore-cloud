@@ -93,6 +93,32 @@ def test_p3_format_memory_returns_archive_card(tmp_path):
     assert formatted["archive_card"]["source_refs"]["source_system"] == "codex"
 
 
+def test_p3_load_defers_archive_card_until_result_formatting(tmp_path):
+    p3 = _reload_p3(tmp_path)
+    zhiyi_path = tmp_path / "memcore" / "zhiyi" / "case_memory" / "case_memory.jsonl"
+    zhiyi_path.parent.mkdir(parents=True, exist_ok=True)
+    zhiyi_path.write_text(json.dumps({
+        "exp_id": "exp-lazy-card",
+        "summary": "延迟生成档案卡",
+        "detail": "缓存不重复生成，返回结果仍必须带完整档案卡。",
+        "score": 0.8,
+        "source_refs": json.dumps({
+            "source_system": "codex",
+            "source_path": str(tmp_path / "source.jsonl"),
+            "msg_ids": ["m-lazy"],
+        }, ensure_ascii=False),
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    loaded = p3.load_memories()
+
+    assert len(loaded) == 1
+    assert "archive_card" not in loaded[0]
+    assert "library_card" not in loaded[0]
+    formatted = p3.format_memory(loaded[0], "延迟生成档案卡")
+    assert formatted["archive_card"]["catalog_id"] == formatted["catalog_id"]
+    assert formatted["library_id"].startswith("ZX-")
+
+
 def test_zhiyi_gateway_evidence_and_verbatim_use_catalog_id_without_truncating(tmp_path):
     os.environ["MEMCORE_ROOT"] = str(tmp_path / "memcore")
     os.environ["MEMCORE_CONFIG"] = str(ROOT / "config" / "memcore.json")

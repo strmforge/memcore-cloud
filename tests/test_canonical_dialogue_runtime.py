@@ -258,6 +258,66 @@ def test_materialized_canonical_dialogue_entry_has_self_borrowable_source_ref(tm
     assert borrowed == first_line
 
 
+def test_generation_event_identity_deduplicates_exact_overlap_but_keeps_rewrite(tmp_path):
+    source_path = tmp_path / "native" / "session.jsonl"
+    first_raw = tmp_path / "raw" / "session.jsonl"
+    second_raw = tmp_path / "raw" / "session.seg1.jsonl"
+    third_raw = tmp_path / "raw" / "session.seg2.jsonl"
+    shared_user = {
+        "id": "u1",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "同一条用户内容。"}],
+        },
+    }
+    shared_assistant = {
+        "id": "a1",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "同一条助手内容。"}],
+        },
+    }
+    rewritten_assistant = json.loads(json.dumps(shared_assistant, ensure_ascii=False))
+    rewritten_assistant["payload"]["content"][0]["text"] = "真实改写后的助手内容。"
+    first_meta = {"type": "session_meta", "payload": {"id": "s1", "model_provider": "token"}}
+    second_meta = {"type": "session_meta", "payload": {"id": "s1", "model_provider": "custom"}}
+    _append_jsonl(first_raw, [first_meta, shared_user, shared_assistant])
+    _append_jsonl(second_raw, [second_meta, shared_user, shared_assistant])
+    _append_jsonl(third_raw, [second_meta, shared_user, rewritten_assistant])
+
+    for generation, raw_path in enumerate((first_raw, second_raw, third_raw)):
+        materialize_canonical_dialogue(
+            raw_path,
+            source_system="codex",
+            session_id="s1",
+            canonical_window_id="w1",
+            native_artifact_format="codex_session_jsonl",
+            reset=True,
+            native_source_path=source_path,
+            source_base_offset=0,
+            generation=generation,
+            predecessor=str((first_raw, first_raw, second_raw)[generation]),
+        )
+
+    entries = []
+    for raw_path in (first_raw, second_raw, third_raw):
+        entries.append([
+            json.loads(line)
+            for line in canonical_dialogue_sidecar_path(raw_path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ])
+
+    assert [item["event_id"] for item in entries[0]] == [item["event_id"] for item in entries[1]]
+    assert entries[0][0]["event_id"] == entries[2][0]["event_id"]
+    assert entries[0][1]["event_id"] != entries[2][1]["event_id"]
+    assert entries[1][0]["origin_source_ref"]["generation"] == 1
+    assert entries[1][0]["origin_source_ref"]["native_source_path"] == str(source_path)
+
+
 def test_build_canonical_dialogue_migration_report_emits_ref_map_and_metrics(tmp_path):
     raw_path = tmp_path / "memory" / "local" / "claude_code_cli" / "claude_code_session_jsonl" / "project" / "session.jsonl"
     _append_jsonl(

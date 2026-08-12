@@ -4,6 +4,42 @@
 import datetime
 import importlib.util
 import os
+import time
+from pathlib import Path
+
+
+def write_owned_pid_file(path, pid=None):
+    target = Path(path)
+    owner = int(pid or os.getpid())
+    temporary = target.with_name(f"{target.name}.{owner}.{time.monotonic_ns()}.tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(f"{owner}\n", encoding="ascii")
+        os.replace(temporary, target)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def clear_owned_pid_file(path, pid=None):
+    target = Path(path)
+    owner = int(pid or os.getpid())
+    try:
+        current = int(target.read_text(encoding="ascii").strip())
+    except (OSError, TypeError, ValueError):
+        return False
+    if current != owner:
+        return False
+    try:
+        target.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _safe_runtime_profile_part(name, builder):

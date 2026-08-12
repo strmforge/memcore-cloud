@@ -108,6 +108,26 @@ def test_core_record_reliability_audit_observes_short_catching_up_without_failur
     assert "Re-sample after the active append window" in " ".join(result["action_items"])
 
 
+def test_core_record_reliability_audit_keeps_active_divergence_generation_visible():
+    audit = _load_audit()
+    records = [_record("codex", "source_divergence_generation_active")]
+
+    result = audit.classify_report(
+        _guardian_report(
+            records,
+            raw_attention_count=1,
+            raw_divergence_generation_active_count=1,
+        ),
+        focus_sources=("codex",),
+    )
+
+    assert result["ok"] is False
+    assert result["audit_status"] == "attention"
+    assert result["source_statuses"][0]["state"] == "attention"
+    assert result["summary"]["raw_divergence_generation_active_count"] == 1
+    assert result["summary"]["backfill_recommended_count"] == 0
+
+
 def test_core_record_reliability_audit_treats_source_partial_as_observation():
     audit = _load_audit()
     records = [
@@ -176,6 +196,48 @@ def test_core_record_reliability_audit_treats_lost_source_and_lost_raw_as_attent
     actions = " ".join(result["action_items"])
     assert "遗失 raw" in actions
     assert "遗失源" in actions
+
+
+def test_core_record_reliability_audit_passes_recoverable_lost_source():
+    audit = _load_audit()
+    record = _record("claude_desktop", "source_missing_recoverable_from_raw")
+    record["recoverable_from_raw"] = True
+
+    result = audit.classify_report(
+        _guardian_report(
+            [record],
+            lost_source_count=1,
+            lost_source_recoverable_count=1,
+            lost_source_unrecoverable_count=0,
+            lost_source_not_measured_count=0,
+        ),
+        focus_sources=("claude_desktop",),
+    )
+
+    assert result["ok"] is True
+    assert result["audit_status"] == "pass"
+    assert result["attention_required"] is False
+
+
+def test_core_record_reliability_audit_observes_unmeasured_lost_source():
+    audit = _load_audit()
+    record = _record("claude_desktop", "source_missing_recoverability_unmeasured")
+    record["recoverable_from_raw"] = None
+
+    result = audit.classify_report(
+        _guardian_report(
+            [record],
+            lost_source_count=1,
+            lost_source_recoverable_count=0,
+            lost_source_unrecoverable_count=0,
+            lost_source_not_measured_count=1,
+        ),
+        focus_sources=("claude_desktop",),
+    )
+
+    assert result["ok"] is True
+    assert result["audit_status"] == "observe"
+    assert result["attention_required"] is False
 
 
 def test_core_record_reliability_audit_contract_only_mode_is_release_gate_safe():

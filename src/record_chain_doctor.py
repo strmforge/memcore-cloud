@@ -21,13 +21,22 @@ try:
     from raw_record_canonical_index import query_records_index
 except ImportError:  # pragma: no cover
     from src.raw_record_canonical_index import query_records_index
+try:
+    from raw_record_recoverability import lost_source_triage as _lost_source_triage
+except ImportError:  # pragma: no cover
+    from src.raw_record_recoverability import lost_source_triage as _lost_source_triage
 
 
 RECORD_CHAIN_DOCTOR_CONTRACT = "record_chain_doctor.v1"
 RECORD_CHAIN_TIMELINE_CONTRACT = "record_chain_timeline.v1"
 RECORD_CHAIN_REPLAY_CONTRACT = "record_chain_replay.v1"
 RECORD_CHAIN_PARENT_TIANDAO_CONTRACT = "tiandao_time_river.v1"
-GUARDED_STATUSES = {"record_guarded", "record_stat_guarded"}
+GUARDED_STATUSES = {
+    "record_guarded",
+    "record_stat_guarded",
+    "authorized_raw_recoverable_source_missing",
+    "source_missing_recoverable_from_raw",
+}
 ATTENTION_STATUSES = {"raw_missing", "source_corrupt", "raw_corrupt"}
 
 
@@ -120,7 +129,7 @@ def _doctor_status(summary: dict[str, Any], canonical: dict[str, Any]) -> tuple[
     guarded = _int(summary.get("record_guarded_count"))
     attention = _int(summary.get("raw_attention_count"))
     backfill = _int(summary.get("backfill_recommended_count"))
-    lost_source = _int(summary.get("lost_source_count"))
+    lost_source, _recoverable_source, unrecoverable_source, unmeasured_source = _lost_source_triage(summary)
     lost_raw = _int(summary.get("lost_raw_count"))
     corrupt = _int(summary.get("corrupt_record_count"))
     catching_up = _int(summary.get("raw_catching_up_count"))
@@ -132,7 +141,7 @@ def _doctor_status(summary: dict[str, Any], canonical: dict[str, Any]) -> tuple[
             "No local source records were seen yet.",
             "还没有看到本机来源记录。",
         )
-    if lost_source or lost_raw or attention or corrupt:
+    if unrecoverable_source or lost_raw or attention or corrupt:
         return (
             "attention",
             "Some records need attention before the chain is fully guarded.",
@@ -143,6 +152,12 @@ def _doctor_status(summary: dict[str, Any], canonical: dict[str, Any]) -> tuple[
             "needs_backfill",
             "Records were found, and explicit backfill is recommended.",
             "已发现记录，但建议显式回填。",
+        )
+    if unmeasured_source:
+        return (
+            "recoverability_evidence_incomplete",
+            "Raw is retained, but bounded recovery evidence is still incomplete.",
+            "Raw 仍在，但有界可恢复性证据尚未补齐。",
         )
     if catching_up and guarded < record_count:
         return (
@@ -185,11 +200,13 @@ def build_record_doctor(
         public=public,
     )
     summary = _dict(guardian.get("summary"))
+    summary_scope = _dict(guardian.get("summary_scope"))
     totals = _dict(canonical.get("totals"))
     status, headline, zh_headline = _doctor_status(summary, canonical)
     attention = _int(summary.get("raw_attention_count"))
+    active_generations = _int(summary.get("raw_divergence_generation_active_count"))
     backfill = _int(summary.get("backfill_recommended_count"))
-    lost_source = _int(summary.get("lost_source_count"))
+    lost_source, recoverable_source, unrecoverable_source, unmeasured_source = _lost_source_triage(summary)
     lost_raw = _int(summary.get("lost_raw_count"))
     corrupt = _int(summary.get("corrupt_record_count"))
     raw_not_current = _int(summary.get("raw_not_current_count"))
@@ -221,8 +238,14 @@ def build_record_doctor(
             "id": "lost_records",
             "label": "Lost source / lost raw",
             "zh_label": "遗失源 / 遗失 raw",
-            "ok": lost_source == 0 and lost_raw == 0,
-            "value": {"lost_source": lost_source, "lost_raw": lost_raw},
+            "ok": unrecoverable_source == 0 and lost_raw == 0,
+            "value": {
+                "lost_source": lost_source,
+                "lost_source_recoverable": recoverable_source,
+                "lost_source_unrecoverable": unrecoverable_source,
+                "lost_source_not_measured": unmeasured_source,
+                "lost_raw": lost_raw,
+            },
         },
         {
             "id": "canonical_index",
@@ -246,15 +269,24 @@ def build_record_doctor(
     next_actions: list[str] = []
     if lost_raw or backfill:
         next_actions.append("Run explicit record backfill for the affected source.")
-    if lost_source:
-        next_actions.append("Use guarded raw as recovery evidence, then rebuild the index if needed.")
+    if unrecoverable_source:
+        next_actions.append("Inspect measured-unrecoverable raw as recovery evidence before any source repair.")
+    if unmeasured_source:
+        next_actions.append("Complete the bounded lost-source structural check; do not treat unmeasured as lost.")
+    if active_generations:
+        next_actions.append("Review active divergence generations; continuation is guarded and backfill is not implied.")
     if not canonical.get("ok"):
         next_actions.append("Refresh the canonical index from guarded records when you want searchable replay.")
     if not next_actions and status == "records_guarded":
         next_actions.append("No action needed; the record chain is ready for recall and experience.")
 
     return {
-        "ok": status in {"records_guarded", "records_guarded_index_not_ready", "catching_up"},
+        "ok": status in {
+            "records_guarded",
+            "records_guarded_index_not_ready",
+            "catching_up",
+            "recoverability_evidence_incomplete",
+        },
         "contract": RECORD_CHAIN_DOCTOR_CONTRACT,
         "parent_tiandao_contract": RECORD_CHAIN_PARENT_TIANDAO_CONTRACT,
         "audience": "product_read_only_self_check",
@@ -268,15 +300,26 @@ def build_record_doctor(
         "headline": headline,
         "zh_headline": zh_headline,
         "record_chain_mode": "source_to_raw_to_canonical_to_memory_experience",
+        "summary_scope": summary_scope,
         "not_memory_wall": True,
         "summary": {
             "record_count": _int(summary.get("record_count")),
+            "physical_record_count": _int(summary.get("physical_record_count")),
+            "logical_record_count": _int(summary.get("logical_record_count")),
+            "layout_variant_count": _int(summary.get("layout_variant_count")),
             "record_guarded_count": _int(summary.get("record_guarded_count")),
             "record_stat_guarded_count": _int(summary.get("record_stat_guarded_count")),
             "raw_not_current_count": raw_not_current,
             "raw_attention_count": attention,
+            "raw_divergence_generation_active_count": active_generations,
+            "raw_metadata_only_divergence_count": _int(summary.get("raw_metadata_only_divergence_count")),
             "backfill_recommended_count": backfill,
             "lost_source_count": lost_source,
+            "lost_source_recoverable_count": recoverable_source,
+            "lost_source_unrecoverable_count": unrecoverable_source,
+            "lost_source_not_measured_count": unmeasured_source,
+            "lost_source_one_sided_count": _int(summary.get("lost_source_one_sided_count")),
+            "lost_source_non_conversation_count": _int(summary.get("lost_source_non_conversation_count")),
             "lost_raw_count": lost_raw,
             "origin_event_count": _int(summary.get("origin_event_count") or summary.get("origin_witnessed_count")),
             "canonical_sessions": _int(totals.get("canonical_sessions")),
@@ -573,7 +616,11 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
         "",
         f"- Records: {summary.get('record_guarded_count', 0)}/{summary.get('record_count', 0)} guarded",
         f"- Canonical messages: {summary.get('canonical_messages', 0)}",
-        f"- Lost source / lost raw: {summary.get('lost_source_count', 0)} / {summary.get('lost_raw_count', 0)}",
+        f"- Lost source (recoverable / unrecoverable / not measured): "
+        f"{summary.get('lost_source_recoverable_count', 0)} / "
+        f"{summary.get('lost_source_unrecoverable_count', 0)} / "
+        f"{summary.get('lost_source_not_measured_count', 0)}",
+        f"- Lost raw: {summary.get('lost_raw_count', 0)}",
         f"- Attention / backfill: {summary.get('raw_attention_count', 0)} / {summary.get('backfill_recommended_count', 0)}",
         "",
         "## Checks",

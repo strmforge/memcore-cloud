@@ -76,6 +76,72 @@ def _write_codex_session(tmp_path):
     return sessions.parent.parent.parent, session_index, session_path
 
 
+def test_codex_fast_discovery_does_not_read_session_bodies(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions = tmp_path / "codex-sessions"
+    sessions.mkdir()
+    for index in range(1251):
+        (sessions / f"rollout-2026-08-13T00-00-00-fast-{index:04d}.jsonl").write_bytes(
+            b"session body must remain unread\n"
+        )
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
+    monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+
+    def forbidden(_path):
+        raise AssertionError("fast Codex discovery read a session body")
+
+    monkeypatch.setattr(codex_local_connector, "_read_session_meta", forbidden)
+
+    artifacts = codex_local_connector.discover_sessions(limit=0, scan_mode="fast")
+
+    assert len(artifacts) == 1251
+    assert {item["session_id"] for item in artifacts} == {
+        f"fast-{index:04d}" for index in range(1251)
+    }
+    assert all(item["discovery_scan_mode"] == "fast" for item in artifacts)
+    assert all(item["session_meta_body_read_performed"] is False for item in artifacts)
+
+
+def test_codex_fast_discovery_does_not_guess_between_duplicate_raw_archives(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions = tmp_path / "codex-sessions"
+    sessions.mkdir()
+    source = sessions / "rollout-2026-08-13T00-00-00-duplicate-session.jsonl"
+    source.write_bytes(b"session body must remain unread\n")
+    memory = tmp_path / "memory"
+    for computer in ("first", "second"):
+        raw = (
+            memory
+            / computer
+            / "codex"
+            / "codex_session_jsonl"
+            / "project"
+            / "duplicate-session.jsonl"
+        )
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(b"retained raw\n")
+    monkeypatch.setattr(codex_local_connector, "memory_root", lambda: str(memory))
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
+    monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+    monkeypatch.setattr(
+        codex_local_connector,
+        "_read_session_meta",
+        lambda _path: (_ for _ in ()).throw(AssertionError("fast discovery read a body")),
+    )
+
+    artifact = codex_local_connector.discover_sessions(limit=0, scan_mode="fast")[0]
+
+    assert artifact["raw_archive_identity_status"] == "ambiguous"
+    assert artifact["raw_archive_path_hint"] == ""
+    assert artifact["canonical_window_id"] == "no-cwd"
+
+
 def test_codex_scan_and_p2_extract(tmp_path):
     codex_sessions, session_index, _ = _write_codex_session(tmp_path)
     env = _env(tmp_path, codex_sessions, session_index)
@@ -286,6 +352,181 @@ def test_codex_scan_retains_raw_when_source_regresses(tmp_path):
     checkpoint = json.loads((tmp_path / "memcore" / ".checkpoint").read_text(encoding="utf-8"))
     codex_entries = [value for key, value in checkpoint.items() if key.startswith("codex:")]
     assert codex_entries[0]["offset"] == len(archived_bytes)
+
+
+def test_codex_inode_drift_with_append_continuity_does_not_report_raw_missing(tmp_path):
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    env = _env(tmp_path, codex_sessions, session_index)
+    first_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    first_item = json.loads(first_scan.stdout)["items"][0]
+    dest = Path(first_item["dest"])
+    first_meta = json.loads(Path(str(dest) + ".meta.json").read_text(encoding="utf-8"))
+    old_inode = session_path.stat().st_ino
+    replacement = session_path.with_suffix(".replacement")
+    replacement.write_bytes(session_path.read_bytes() + b'{"type":"event_msg","payload":{"type":"user_message","message":"tail"}}\n')
+    os.replace(replacement, session_path)
+    assert session_path.stat().st_ino != old_inode
+
+    status = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--status"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    raw_sync = json.loads(status.stdout)["raw_sync"]
+
+    assert raw_sync["raw_missing_count"] == 0
+    assert raw_sync["status"] in {"raw_catching_up", "raw_lagging_sla_breach"}
+
+    second_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    second_item = json.loads(second_scan.stdout)["items"][0]
+    second_meta = json.loads(Path(str(dest) + ".meta.json").read_text(encoding="utf-8"))
+
+    assert second_item["dest"] == str(dest)
+    assert second_item["status"].startswith("appended")
+    assert second_meta["raw_order"] == first_meta["raw_order"]
+    assert dest.read_bytes() == session_path.read_bytes()
+    assert not list(dest.parent.glob(f"{dest.stem}.seg*{dest.suffix}"))
+
+
+def test_codex_divergence_generation_continues_and_reanchors_canonical_dialogue(tmp_path):
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    env = _env(tmp_path, codex_sessions, session_index)
+
+    first_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    first_payload = json.loads(first_scan.stdout)
+    original_dest = Path(first_payload["items"][0]["dest"])
+    original_bytes = original_dest.read_bytes()
+    original_lines = session_path.read_bytes().splitlines(keepends=True)
+    assert len(original_lines) == 3
+
+    rewritten_assistant = json.loads(original_lines[2].decode("utf-8"))
+    rewritten_assistant["payload"]["content"][0]["text"] = "改写后的 assistant 内容，必须保留为新 generation。"
+    new_user = {
+        "timestamp": "2026-05-27T10:00:03Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "分歧之后继续写入的新问题。"}],
+        },
+    }
+    rewritten = b"".join(original_lines[:2])
+    rewritten += (json.dumps(rewritten_assistant, ensure_ascii=False) + "\n").encode("utf-8")
+    rewritten += (json.dumps(new_user, ensure_ascii=False) + "\n").encode("utf-8")
+    session_path.write_bytes(rewritten)
+    expected_base = len(b"".join(original_lines[:2]))
+
+    second_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    second_payload = json.loads(second_scan.stdout)
+    second_item = second_payload["items"][0]
+    generation_dest = Path(second_item["dest"])
+    generation_meta = json.loads(Path(str(generation_dest) + ".meta.json").read_text(encoding="utf-8"))
+    checkpoint = json.loads((tmp_path / "memcore" / ".checkpoint").read_text(encoding="utf-8"))
+    checkpoint_entry = next(value for key, value in checkpoint.items() if key.startswith("codex:"))
+
+    assert second_item["status"].startswith("generation_started")
+    assert generation_dest.name == original_dest.stem + ".seg1" + original_dest.suffix
+    assert original_dest.read_bytes() == original_bytes
+    assert generation_dest.read_bytes() == rewritten[expected_base:]
+    assert generation_meta["raw_generation"] == 1
+    assert generation_meta["source_base_offset"] == expected_base
+    assert generation_meta["raw_order"] == 2
+    assert checkpoint_entry["generation"] == 1
+    assert checkpoint_entry["source_base_offset"] == expected_base
+    assert checkpoint_entry["archived_to"] == str(generation_dest)
+
+    old_dialogue = [
+        json.loads(line)
+        for line in Path(str(original_dest) + ".canonical_dialogue.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    new_dialogue = [
+        json.loads(line)
+        for line in Path(str(generation_dest) + ".canonical_dialogue.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [item["role"] for item in new_dialogue] == ["assistant", "user"]
+    assert all(
+        item["origin_source_ref"]["native_source_byte_offsets"]["start"] >= expected_base
+        for item in new_dialogue
+    )
+    assert old_dialogue[0]["event_id"] != new_dialogue[0]["event_id"]
+
+    new_assistant = {
+        "timestamp": "2026-05-27T10:00:04Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "新 generation 的后续回复。"}],
+        },
+    }
+    with session_path.open("ab") as handle:
+        handle.write((json.dumps(new_assistant, ensure_ascii=False) + "\n").encode("utf-8"))
+    third_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    third_item = json.loads(third_scan.stdout)["items"][0]
+    generation_bytes_after = generation_dest.read_bytes()
+    generation_dialogue_after = [
+        json.loads(line)
+        for line in Path(str(generation_dest) + ".canonical_dialogue.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert third_item["dest"] == str(generation_dest)
+    assert third_item["status"].startswith("appended_generation")
+    assert generation_bytes_after == rewritten[expected_base:] + (
+        json.dumps(new_assistant, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    assert [item["role"] for item in generation_dialogue_after] == ["assistant", "user", "assistant"]
+    snapshot = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--status"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    raw_sync = json.loads(snapshot.stdout)["raw_sync"]
+    assert raw_sync["raw_archive_max_lag_bytes"] == 0
+    assert raw_sync["raw_divergence_generation_active_count"] == 1
 
 
 def test_codex_checkpoint_write_uses_unique_temp_path(tmp_path):
@@ -650,6 +891,44 @@ def test_codex_catch_up_latest_sessions_chases_active_tail(tmp_path):
     assert payload["raw_sync"]["status"] == "raw_current"
     assert payload["raw_sync"]["missing_or_stale_count"] == 0
     assert payload["raw_sync"]["raw_archive_max_lag_bytes"] == 0
+
+
+def test_codex_catch_up_does_not_retry_terminal_divergence(monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    scan_calls = []
+    snapshot_calls = []
+    terminal_snapshot = {
+        "status": "source_divergence_raw_retained",
+        "missing_or_stale_count": 1,
+        "raw_source_divergence_count": 1,
+        "raw_source_regression_count": 0,
+        "raw_monotonic_probe_incomplete_count": 0,
+        "raw_catch_up_actionable_count": 0,
+    }
+
+    monkeypatch.setattr(
+        codex_local_connector,
+        "scan_sessions",
+        lambda **kwargs: scan_calls.append(kwargs) or {"changed": 0, "items": []},
+    )
+    monkeypatch.setattr(
+        codex_local_connector,
+        "raw_sync_snapshot",
+        lambda **kwargs: snapshot_calls.append(kwargs) or terminal_snapshot,
+    )
+
+    result = codex_local_connector.catch_up_latest_sessions(
+        limit=8,
+        budget_ms=5000,
+        max_passes=6,
+    )
+
+    assert result["passes"] == 1
+    assert result["ok"] is False
+    assert scan_calls == [{"dry_run": False, "limit": 8, "public": False}]
+    assert snapshot_calls == [{"limit": 8}]
 
 
 def test_p2_zhiyi_experience_detail_preserves_saved_content_verbatim(tmp_path):

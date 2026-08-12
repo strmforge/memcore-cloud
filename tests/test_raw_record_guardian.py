@@ -2,7 +2,10 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -636,6 +639,42 @@ def test_raw_record_guardian_marks_authorized_raw_with_missing_source_as_lost_so
     assert report["summary"]["recoverable_origin_count"] == 1
 
 
+def test_full_guardian_treats_retained_raw_after_platform_source_deletion_as_recoverable(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    source_path, _raw_path = _write_openclaw_source_and_raw(tmp_path, monkeypatch, raw=True)
+    source_path.unlink()
+    monkeypatch.setattr(
+        raw_record_guardian,
+        "_openclaw_source_artifacts",
+        lambda _limit: [{
+            "source_system": "openclaw",
+            "artifact_type": "openclaw_session_jsonl",
+            "session_id": "openclaw-guardian",
+            "canonical_window_id": "main",
+            "agent_id": "main",
+            "source_path": str(source_path),
+        }],
+    )
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["openclaw"],
+    )
+
+    item = next(item for item in report["records"] if item["source_system"] == "openclaw")
+    assert item["origin_status"] == "lost_source"
+    assert item["guard_status"] == "source_missing_recoverable_from_raw"
+    assert item["recoverable_from_raw"] is True
+    assert report["summary"]["lost_source_recoverable_count"] == 1
+    assert report["summary"]["lost_source_unrecoverable_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+    assert report["ok"] is True
+
+
 def test_raw_record_guardian_leaves_claude_desktop_gap_without_authorized_raw(tmp_path, monkeypatch):
     import raw_record_guardian
 
@@ -777,6 +816,24 @@ def test_openclaw_backfill_retains_raw_after_source_truncation(tmp_path, monkeyp
     assert item["raw_shrink_performed"] is False
     assert item["write_performed"] is False
     assert raw_path.read_bytes() == archived_bytes
+
+
+def test_openclaw_backfill_retains_raw_after_source_divergence_without_generation(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    source_path, raw_path = _write_openclaw_source_and_raw(tmp_path, monkeypatch, raw=True)
+    archived_bytes = raw_path.read_bytes()
+    source_bytes = source_path.read_bytes()
+    source_path.write_bytes(source_bytes.replace(b"OpenClaw assistant", b"Rewritten assistant"))
+
+    second = raw_record_guardian.run_raw_backfill(limit=20, source_systems=["openclaw"])
+    item = second["results"][0]["result"]["items"][0]
+
+    assert item["status"] == "source_divergence_raw_retained"
+    assert item["source_regression"] is False
+    assert item["write_performed"] is False
+    assert raw_path.read_bytes() == archived_bytes
+    assert not list(raw_path.parent.glob(f"{raw_path.stem}.seg*{raw_path.suffix}"))
 
 
 def test_raw_record_guardian_compact_records_include_lost_detail_fields(tmp_path, monkeypatch):
@@ -959,6 +1016,37 @@ def test_raw_record_backfill_target_allowlist_writes_only_requested_raw(tmp_path
     assert not extra_raw.exists()
 
 
+def test_targeted_connector_backfill_counts_generation_start_as_write(tmp_path, monkeypatch):
+    import raw_record_backfill
+
+    source = tmp_path / "source.jsonl"
+    source.write_text('{}\n', encoding="utf-8")
+    raw = tmp_path / "raw.jsonl"
+    connector = type(sys)("generation_connector")
+    connector.discover_sessions = lambda *, limit: [{
+        "source_path": str(source),
+        "session_id": "session-1",
+    }]
+    connector._raw_dest_for_artifact = lambda _artifact: raw
+    connector.archive_session_incremental = lambda *_args, **_kwargs: (
+        str(raw.with_name("raw.seg1.jsonl")),
+        "generation_started(generation=1,base=3,bytes=0)",
+    )
+    monkeypatch.setitem(sys.modules, "generation_connector", connector)
+
+    result = raw_record_backfill._connector_backfill(
+        "codex",
+        "generation_connector",
+        limit=20,
+        target_raw_paths={str(raw)},
+    )
+
+    assert result["ok"] is True
+    assert result["changed"] == 1
+    assert result["result"]["write_performed"] is True
+    assert result["result"]["items"][0]["changed"] is True
+
+
 def test_raw_record_guardian_jsonl_atomic_writer_uses_lf_bytes(tmp_path):
     import raw_record_guardian
 
@@ -979,6 +1067,74 @@ def test_raw_record_guardian_jsonl_atomic_writer_uses_lf_bytes(tmp_path):
     assert first_hash == second_hash
     assert b"\r\n" not in raw_path.read_bytes()
     assert raw_path.read_bytes().endswith(b"\n")
+
+
+def test_raw_record_guardian_lightweight_status_does_not_call_active_generation_stale(monkeypatch):
+    import raw_record_guardian
+
+    monkeypatch.setattr(raw_record_guardian, "build_guardian_status", lambda **_kwargs: {
+        "ok": True,
+        "summary": {
+            "record_count": 1,
+            "record_guarded_count": 1,
+            "raw_not_current_count": 0,
+            "raw_attention_count": 1,
+            "raw_divergence_generation_active_count": 1,
+            "backfill_recommended_count": 0,
+        },
+        "recoverability_probe": {
+            "candidate_count": 2,
+            "candidate_limit": 80,
+            "per_file_byte_limit": 32 * 1024 * 1024,
+            "round_byte_limit": 64 * 1024 * 1024,
+            "targeted_scan_count": 1,
+            "cache_hit_count": 0,
+            "canonical_cache_hit_count": 1,
+            "measured_count": 2,
+            "not_measured_count": 0,
+            "bytes_read": 4096,
+            "budget_exhausted_count": 0,
+            "one_sided_count": 1,
+            "non_conversation_count": 0,
+            "canonical_cache_status": "available",
+        },
+        "guarded_sources": ["codex"],
+        "gap_sources": [],
+        "summary_scope": {"population_complete": True},
+    })
+
+    snapshot = raw_record_guardian.status()
+
+    assert snapshot["raw_attention_count"] == 1
+    assert snapshot["raw_divergence_generation_active_count"] == 1
+    assert snapshot["raw_not_current_count"] == 0
+    assert snapshot["raw_sync"]["missing_or_stale_count"] == 0
+    assert snapshot["raw_sync"]["status"] == "ok"
+    assert snapshot["recoverability_probe"]["schema"] == "recoverability_probe.v1"
+    assert snapshot["recoverability_probe"]["targeted_scan_count"] == 1
+    assert snapshot["recoverability_probe"]["canonical_cache_hit_count"] == 1
+
+
+def test_public_recoverability_probe_is_bounded_and_fails_closed():
+    import raw_record_guardian
+
+    valid = {
+        field: 0
+        for field in raw_record_guardian._RECOVERABILITY_PROBE_INT_FIELDS
+    }
+    valid["canonical_cache_status"] = "sqlite_open_failed:PrivatePath"
+
+    projected = raw_record_guardian._safe_recoverability_probe(valid)
+
+    assert projected["schema"] == "recoverability_probe.v1"
+    assert projected["canonical_cache_status"] == "unavailable"
+    assert "PrivatePath" not in json.dumps(projected)
+    invalid = dict(valid)
+    invalid["bytes_read"] = -1
+    assert raw_record_guardian._safe_recoverability_probe(invalid) is None
+    invalid["bytes_read"] = 0
+    invalid["canonical_cache_status"] = ""
+    assert raw_record_guardian._safe_recoverability_probe(invalid) is None
 
 
 def test_raw_record_guardian_reports_record_guarded_after_raw_mirror(tmp_path, monkeypatch):
@@ -1492,6 +1648,199 @@ def test_canonical_record_index_appends_codex_tail_without_rebuilding_existing_r
     assert "增量追尾" in after[-1][2]
 
 
+def test_guardian_and_canonical_index_follow_divergence_generation_lineage(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    original_raw = Path(first_scan["items"][0]["dest"])
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+
+    source_lines = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+    source_lines[0]["payload"]["model"] = "rewritten-session-metadata"
+    source_lines[2]["payload"]["content"][0]["text"] = "改写后的回复应作为独立内容版本保留。"
+    source_lines.extend([
+        {
+            "timestamp": "2026-06-07T10:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "分代后的新问题。"}],
+            },
+        },
+        {
+            "timestamp": "2026-06-07T10:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "分代后的新回复。"}],
+            },
+        },
+    ])
+    session_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in source_lines),
+        encoding="utf-8",
+    )
+    second_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    generation_raw = Path(second_scan["items"][0]["dest"])
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+    item = report["records"][0]
+    db_path = Path(report["index_update"]["db_path"])
+    conn = sqlite3.connect(db_path)
+    try:
+        messages = conn.execute(
+            """
+            select content_preview, raw_path, source_offset_start, raw_offset_start, payload_json
+            from canonical_messages
+            where source_system='codex'
+            order by timestamp, content_preview
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    previews = [row[0] for row in messages]
+    assert generation_raw != original_raw
+    assert item["guard_status"] == "source_divergence_generation_active"
+    assert item["raw_current"] is True
+    assert item["raw_scan"]["generation_lineage_complete"] is True
+    assert item["raw_scan"]["generation_lineage_count"] == 2
+    assert item["raw_scan"]["has_user_and_assistant"] is True
+    assert item["sync"]["raw_covered_source_bytes"] == session_path.stat().st_size
+    assert item["sync"]["raw_archive_lag_bytes"] == 0
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["record_guarded_count"] == 1
+    assert report["summary"]["raw_not_current_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 1
+    assert report["summary"]["raw_source_divergence_count"] == 1
+    assert report["summary"]["raw_divergence_generation_active_count"] == 1
+    assert previews.count("守住原始记录。") == 1
+    assert previews.count("已镜像 raw，并可回源。") == 1
+    assert previews.count("改写后的回复应作为独立内容版本保留。") == 1
+    assert previews.count("分代后的新问题。") == 1
+    assert previews.count("分代后的新回复。") == 1
+    assert len(messages) == 5
+    overlap = next(row for row in messages if row[0] == "守住原始记录。")
+    old_version = next(row for row in messages if row[0] == "已镜像 raw，并可回源。")
+    new_version = next(row for row in messages if row[0] == "改写后的回复应作为独立内容版本保留。")
+    assert overlap[1] == str(generation_raw)
+    assert old_version[1] == str(original_raw)
+    assert new_version[1] == str(generation_raw)
+    assert overlap[2] >= 0 and overlap[3] >= 0
+    overlap_payload = json.loads(overlap[4])
+    assert overlap_payload["raw_generation"] == 1
+    assert overlap_payload["predecessor_raw_path"] == str(original_raw)
+
+
+def test_guardian_generation_lineage_prevents_suffix_only_partial_false_positive(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    original_raw = Path(first_scan["items"][0]["dest"])
+    lines = session_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    rewritten_assistant = json.loads(lines[2])
+    rewritten_assistant["payload"]["content"][0]["text"] = "只改写 assistant，suffix 本身没有 user。"
+    session_path.write_bytes(
+        "".join(lines[:2]).encode("utf-8")
+        + (json.dumps(rewritten_assistant, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    second_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    generation_raw = Path(second_scan["items"][0]["dest"])
+    suffix_scan = raw_record_guardian.scan_jsonl_record(generation_raw, source_system="codex")
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="full",
+        public=False,
+        source_systems=["codex"],
+    )
+    item = report["records"][0]
+
+    assert generation_raw != original_raw
+    assert suffix_scan["has_user_and_assistant"] is False
+    assert suffix_scan["assistant_turn_count"] == 1
+    assert item["raw_scan"]["has_user_and_assistant"] is True
+    assert item["raw_scan"]["generation_lineage_count"] == 2
+    assert item["guard_status"] == "source_divergence_generation_active"
+    assert item["raw_current"] is True
+    assert item["backfill_recommended"] is False
+
+
+def test_invalid_generation_descriptor_fails_closed_across_connector_and_guardian(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_archive_monotonic
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    original_raw = Path(first_scan["items"][0]["dest"])
+    original_bytes = original_raw.read_bytes()
+    lines = session_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    rewritten_assistant = json.loads(lines[2])
+    rewritten_assistant["payload"]["content"][0]["text"] = "建立分代后再损坏 descriptor。"
+    session_path.write_bytes(
+        "".join(lines[:2]).encode("utf-8")
+        + (json.dumps(rewritten_assistant, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    second_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    generation_raw = Path(second_scan["items"][0]["dest"])
+    generation_bytes = generation_raw.read_bytes()
+    descriptor_path = raw_archive_monotonic.generation_descriptor_path(generation_raw)
+    descriptor_path.write_text("{}", encoding="utf-8")
+    artifact = codex_local_connector.artifact_from_path(session_path)
+
+    sync_item = codex_local_connector._raw_sync_item(artifact)
+    blocked_dest, blocked_status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+    )
+    item = report["records"][0]
+
+    assert sync_item["raw_generation_descriptor_incomplete"] is True
+    assert sync_item["raw_monotonic_probe_ok"] is False
+    assert sync_item["raw_monotonic_status"] == "raw_generation_descriptor_incomplete"
+    assert blocked_dest == str(generation_raw)
+    assert blocked_status.startswith("source_divergence_generation_fail_closed")
+    assert item["guard_status"] == "raw_monotonic_probe_incomplete"
+    assert item["sync"]["raw_generation_descriptor_incomplete"] is True
+    assert item["sync"]["raw_body_read_performed"] is False
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["raw_monotonic_probe_incomplete_count"] == 1
+    assert report["summary"]["raw_attention_count"] == 1
+    assert original_raw.read_bytes() == original_bytes
+    assert generation_raw.read_bytes() == generation_bytes
+    assert not (generation_raw.parent / generation_raw.name.replace(".seg1.", ".seg2.")).exists()
+
+
 def test_canonical_record_index_skips_unchanged_records_on_repeat_build(tmp_path, monkeypatch):
     import codex_local_connector
     import raw_record_guardian
@@ -1598,6 +1947,113 @@ def test_canonical_index_refresh_due_detects_tracked_source_change(tmp_path, mon
     assert changed["refresh_needed"] is True
     assert changed["reason"] == "tracked_source_stat_changed"
     assert changed["changed_records"] == 1
+
+
+def test_changed_record_refresh_drains_due_without_catalog_rediscovery(tmp_path, monkeypatch):
+    import canonical_index_delta_refresh
+    import codex_local_connector
+    import raw_record_canonical_index
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+    _append_jsonl(session_path, [{
+        "timestamp": "2026-06-07T10:00:04Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "只刷新变更记录。"}],
+        },
+    }])
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    _dest, status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    assert status.startswith("appended")
+
+    public_due = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+    )
+    internal_due = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+        include_internal_targets=True,
+    )
+
+    assert public_due["changed_records"] == 1
+    assert "_internal_changed_record_ids" not in public_due
+    assert len(internal_due["_internal_changed_record_ids"]) == 1
+
+    refreshed = canonical_index_delta_refresh.refresh_changed_records_index(
+        internal_due["_internal_changed_record_ids"],
+    )
+    after = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+    )
+
+    assert refreshed["records_upserted"] == 1
+    assert refreshed["canonical_records_refreshed"] == 1
+    assert refreshed["canonical_messages_upserted"] == 1
+    assert after["refresh_needed"] is False
+
+
+def test_changed_record_refresh_preserves_index_when_source_is_missing(tmp_path, monkeypatch):
+    import canonical_index_delta_refresh
+    import codex_local_connector
+    import raw_record_canonical_index
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(scan["items"][0]["dest"])
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+    db_path = Path(os.environ["MEMCORE_RECORDS_DB"])
+    conn = sqlite3.connect(db_path)
+    try:
+        messages_before = conn.execute("select count(*) from canonical_messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    session_path.unlink()
+    with raw_path.open("ab") as handle:
+        handle.write(b'{"type":"retained-raw-tail"}\n')
+    due = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+        include_internal_targets=True,
+    )
+    refreshed = canonical_index_delta_refresh.refresh_changed_records_index(
+        due["_internal_changed_record_ids"],
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        messages_after = conn.execute("select count(*) from canonical_messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert refreshed["records_upserted"] == 1
+    assert refreshed["canonical_records_refreshed"] == 0
+    assert refreshed["source_missing_index_preserved"] == 1
+    assert messages_after == messages_before
+    assert raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+    )["refresh_needed"] is False
 
 
 def test_canonical_index_refresh_due_can_ignore_stale_non_active_sources(tmp_path, monkeypatch):
@@ -1832,6 +2288,74 @@ def test_canonical_index_refresh_due_ignores_source_drift_for_raw_preferred_sour
     assert result["refresh_needed"] is False
     assert result["changed_records"] == 0
     assert result["raw_preferred_source_drift_ignored"] == 1
+
+
+def test_canonical_index_refresh_due_tracks_active_divergence_generation(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_canonical_index
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(first_scan["items"][0]["dest"])
+    original_raw = raw_path.read_bytes()
+
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+    source_bytes = session_path.read_bytes()
+    rewritten = source_bytes.replace("守".encode("utf-8"), "改".encode("utf-8"), 1)
+    assert len(rewritten) == len(source_bytes)
+    session_path.write_bytes(rewritten)
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    generation_dest, status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    generation_raw = Path(generation_dest)
+    assert status.startswith("generation_started")
+    assert generation_raw != raw_path
+
+    divergence = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+        source_systems=["codex"],
+    )
+    assert divergence["records"][0]["guard_status"] == "source_divergence_generation_active"
+    assert raw_path.read_bytes() == original_raw
+
+    with session_path.open("ab") as handle:
+        handle.write(b'{"type":"source-only-tail"}\n')
+
+    source_only = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+    )
+    assert source_only["refresh_needed"] is True
+    assert source_only["reason"] == "tracked_source_stat_changed"
+    assert source_only["changed_records"] == 1
+    assert raw_path.read_bytes() == original_raw
+
+    generation_before = generation_raw.read_bytes()
+    appended_dest, appended_status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    assert appended_dest == str(generation_raw)
+    assert appended_status.startswith("appended_generation")
+    assert generation_raw.read_bytes().startswith(generation_before)
+
+    raw_changed = raw_record_canonical_index.canonical_index_refresh_due(
+        source_systems=["codex"],
+    )
+    assert raw_changed["refresh_needed"] is True
+    assert raw_changed["changed_records"] == 1
 
 
 def test_canonical_index_refresh_due_ignores_missing_source_when_raw_still_exists(tmp_path, monkeypatch):
@@ -2096,6 +2620,161 @@ def test_raw_record_guardian_fast_mode_uses_stat_guard_without_body_scan(tmp_pat
     assert item["raw_scan"]["fast_stat_only"] is True
     assert item["source_scan"]["health_status"] == "stat_only"
     assert item["raw_scan"]["message_count"] is None
+    assert item["recoverable_from_raw"] is None
+    assert item["recoverability_status"] == "not_measured"
+
+
+def test_fast_lost_source_uses_bounded_structural_recoverability_check(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    raw_path, _source_path = _write_claude_desktop_authorized_raw(
+        tmp_path,
+        monkeypatch,
+        source_exists=False,
+    )
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        compact=True,
+        public=False,
+    )
+
+    item = report["records"][0]
+    assert item["origin_status"] == "lost_source"
+    assert item["recoverable_from_raw"] is True
+    assert item["recoverability_status"] == "measured_recoverable"
+    assert item["recoverability_evidence"]["method"] == "targeted_structural_scan"
+    assert report["summary"]["lost_source_recoverable_count"] == 1
+    assert report["summary"]["lost_source_unrecoverable_count"] == 0
+    assert report["summary"]["lost_source_not_measured_count"] == 0
+    assert report["recoverability_probe"]["targeted_scan_count"] == 1
+    assert report["recoverability_probe"]["bytes_read"] == raw_path.stat().st_size
+
+
+def test_fast_lost_source_budget_exhaustion_stays_not_measured(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    _write_claude_desktop_authorized_raw(tmp_path, monkeypatch, source_exists=False)
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+    monkeypatch.setattr(raw_record_guardian, "DEFAULT_LOST_SOURCE_RECOVERABILITY_FILE_BYTES", 1)
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        compact=True,
+        public=False,
+    )
+
+    item = report["records"][0]
+    assert item["recoverable_from_raw"] is None
+    assert item["recoverability_status"] == "not_measured"
+    assert item["recoverability_evidence"]["reason"] == "per_file_byte_limit_exceeded"
+    assert report["summary"]["lost_source_not_measured_count"] == 1
+    assert report["summary"]["lost_source_unrecoverable_count"] == 0
+    assert report["recoverability_probe"]["budget_exhausted_count"] == 1
+
+
+def test_raw_identity_change_invalidates_recoverability_cache(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    raw_path, _source_path = _write_claude_desktop_authorized_raw(
+        tmp_path,
+        monkeypatch,
+        source_exists=False,
+    )
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+    first = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+    )
+    assert first["summary"]["lost_source_recoverable_count"] == 1
+
+    first_record = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])
+    raw_path.write_text(json.dumps(first_record, ensure_ascii=False) + "\n", encoding="utf-8")
+    second = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+    )
+
+    assert second["recoverability_probe"]["cache_hit_count"] == 0
+    assert second["recoverability_probe"]["targeted_scan_count"] == 1
+    assert second["summary"]["lost_source_recoverable_count"] == 1
+    assert second["summary"]["lost_source_unrecoverable_count"] == 0
+    assert second["records"][0]["recoverable_from_raw"] is True
+    assert second["records"][0]["recoverability_class"] == "conversation_one_sided"
+
+
+def test_fast_index_write_preserves_prior_measured_recoverability(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, _ = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+    )
+    fast = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        write_index=True,
+        public=False,
+    )
+
+    conn = sqlite3.connect(os.environ["MEMCORE_RECORDS_DB"])
+    try:
+        row = conn.execute(
+            "select user_turn_count, assistant_turn_count, has_user_and_assistant, recoverable_from_raw from records"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert fast["records"][0]["recoverable_from_raw"] is None
+    assert row == (1, 1, 1, 1)
+
+
+def test_fast_lost_source_prefers_matching_canonical_recoverability_evidence(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    _raw_path, source_path = _write_claude_desktop_authorized_raw(
+        tmp_path,
+        monkeypatch,
+        source_exists=True,
+    )
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+    raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        write_index=True,
+        public=False,
+    )
+    source_path.unlink()
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+    )
+
+    assert report["summary"]["lost_source_recoverable_count"] == 1
+    assert report["recoverability_probe"]["canonical_cache_hit_count"] == 1
+    assert report["recoverability_probe"]["targeted_scan_count"] == 0
+    assert report["recoverability_probe"]["bytes_read"] == 0
+    assert report["records"][0]["recoverability_evidence"]["method"] == "canonical_record_identity_cache"
 
 
 def test_raw_record_guardian_flags_bad_jsonl(tmp_path, monkeypatch):
@@ -2388,6 +3067,426 @@ def test_raw_record_guardian_recommends_backfill_after_extended_lag(tmp_path, mo
     assert report["summary"]["backfill_recommended_count"] == 1
     assert report["summary"]["raw_lagging_or_missing_count"] == 1
     assert report["summary"]["raw_attention_count"] == 1
+
+
+def test_fast_guardian_keeps_unproven_rewrite_fail_closed_without_body_scan(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(first_scan["items"][0]["dest"])
+    raw_before = raw_path.read_bytes()
+
+    rewritten = session_path.read_text(encoding="utf-8").replace(
+        "守住原始记录。",
+        "上游改写了这条源记录；旧 raw 必须保留并显式报告分歧。",
+    )
+    session_path.write_text(rewritten, encoding="utf-8")
+    old = time.time() - 10
+    os.utime(session_path, (old, old))
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+    )
+
+    item = report["records"][0]
+    assert item["guard_status"] == "raw_catching_up"
+    assert item["sync"]["raw_source_divergence"] is False
+    assert item["sync"]["raw_continuity_not_measured"] is True
+    assert item["sync"]["raw_monotonic_status"] == "raw_continuity_not_measured_fast"
+    assert item["sync"]["raw_body_read_performed"] is False
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["raw_not_current_count"] == 1
+    assert report["summary"]["raw_lagging_or_missing_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+    assert report["summary"]["raw_source_divergence_count"] == 0
+    assert report["summary"]["raw_continuity_not_measured_count"] == 1
+    assert report["ok"] is False
+    assert report["summary"]["backfill_recommended_count"] == 0
+    snapshot = codex_local_connector.raw_sync_snapshot(limit=20)
+    assert snapshot["status"] == "source_divergence_raw_retained"
+    assert snapshot["raw_source_divergence_count"] == 1
+    assert snapshot["raw_lag_sla_breach_count"] == 0
+    assert snapshot["raw_catching_up_count"] == 0
+    assert raw_path.read_bytes() == raw_before
+
+
+def test_fast_guardian_summary_uses_population_beyond_detail_limit(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    original = session_path.read_text(encoding="utf-8")
+    index_rows = [json.loads(session_index.read_text(encoding="utf-8"))]
+    for index in (2, 3):
+        session_id = f"019e-test-raw-guardian-{index}"
+        sibling = session_path.with_name(
+            f"rollout-2026-06-07T10-00-0{index}-{session_id}.jsonl"
+        )
+        sibling.write_text(
+            original.replace("019e-test-raw-guardian", session_id),
+            encoding="utf-8",
+        )
+        index_rows.append({"id": session_id, "thread_name": f"Raw Guardian {index}"})
+    session_index.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in index_rows),
+        encoding="utf-8",
+    )
+    archived = codex_local_connector.scan_sessions(dry_run=False, limit=0)
+    assert archived["changed"] == 3
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=1,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+    )
+
+    assert report["summary"]["record_count"] == 3
+    assert report["summary"]["physical_record_count"] == 3
+    assert report["summary"]["logical_record_count"] == 3
+    assert report["summary_scope"]["population_complete"] is True
+    assert report["summary_scope"]["detail_limit"] == 1
+    assert report["summary_scope"]["summary_is_sample"] is False
+    assert report["record_detail_count"] == 1
+    assert report["record_details_truncated"] is True
+    assert len(report["records"]) == 1
+
+
+def test_fast_guardian_scales_to_full_population_without_body_or_prefix_reads(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_archive_monotonic
+    import raw_record_guardian
+
+    codex_sessions, _session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, tmp_path / "missing-index.jsonl")
+    template = session_path.read_bytes()
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    raw_path = codex_local_connector._raw_dest_for_artifact(artifact)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(template)
+    source_stat = session_path.stat()
+    Path(str(raw_path) + ".meta.json").write_text(
+        json.dumps({
+            "source_inode": source_stat.st_ino,
+            "source_mtime": source_stat.st_mtime,
+            "file_offset": source_stat.st_size,
+        }),
+        encoding="utf-8",
+    )
+    artifacts = [artifact] * 1251
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("fast Guardian read a source/raw body or invoked prefix append")
+
+    monkeypatch.setattr(codex_local_connector, "select_archive_segment", forbidden)
+    monkeypatch.setattr(codex_local_connector, "append_source_file", forbidden)
+    monkeypatch.setattr(codex_local_connector, "cached_divergence_witness_visible", forbidden)
+    monkeypatch.setattr(codex_local_connector, "_metadata_only_divergence_probe", forbidden)
+    monkeypatch.setattr(raw_archive_monotonic, "_prefix_matches", forbidden)
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=1,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+        connector_artifacts={"codex": artifacts},
+    )
+
+    assert report["summary"]["record_count"] == 1251
+    assert report["summary"]["record_stat_guarded_count"] == 1251
+    assert report["summary"]["raw_continuity_not_measured_count"] == 0
+    assert report["summary_scope"]["population_complete"] is False
+    assert report["summary_scope"]["summary_is_sample"] is True
+    assert report["summary_scope"]["sources"]["codex"]["included_count"] == 1251
+    assert report["summary_scope"]["sources"]["codex"]["targeted"] is True
+    assert report["record_detail_count"] == 1
+    assert report["records"][0]["sync"]["raw_body_read_performed"] is False
+
+
+def test_fast_guardian_full_discovery_population_over_detail_limit_remains_complete(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, _session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, tmp_path / "missing-index.jsonl")
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    raw_path = codex_local_connector._raw_dest_for_artifact(artifact)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(session_path.read_bytes())
+    source_stat = session_path.stat()
+    Path(str(raw_path) + ".meta.json").write_text(
+        json.dumps({
+            "source_inode": source_stat.st_ino,
+            "source_mtime": source_stat.st_mtime,
+            "file_offset": source_stat.st_size,
+        }),
+        encoding="utf-8",
+    )
+    artifacts = [artifact] * 1251
+    discovery_calls = []
+
+    def discover_sessions(*, limit, scan_mode):
+        discovery_calls.append({"limit": limit, "scan_mode": scan_mode})
+        return artifacts[:limit]
+
+    monkeypatch.setattr(codex_local_connector, "discover_sessions", discover_sessions)
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=1,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+    )
+
+    assert report["summary"]["record_count"] == 1251
+    assert report["summary_scope"]["population_complete"] is True
+    assert report["summary_scope"]["summary_is_sample"] is False
+    assert report["summary_scope"]["detail_limit"] == 1
+    assert report["summary_scope"]["population_limit_per_source"] == 2000
+    assert report["record_detail_count"] == 1
+    assert discovery_calls == [{"limit": 2001, "scan_mode": "fast"}]
+
+
+def test_fast_guardian_keeps_unproven_legacy_pairing_fail_closed(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, _session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, tmp_path / "missing-index.jsonl")
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    raw_path = codex_local_connector._raw_dest_for_artifact(artifact)
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(session_path.read_bytes())
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+    )
+
+    item = report["records"][0]
+    assert item["guard_status"] == "raw_continuity_not_measured"
+    assert item["raw_current"] is False
+    assert item["sync"]["raw_continuity_not_measured"] is True
+    assert item["sync"]["raw_monotonic_probe_ok"] is None
+    assert item["sync"]["raw_body_read_performed"] is False
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["record_stat_guarded_count"] == 0
+    assert report["summary"]["raw_continuity_not_measured_count"] == 1
+    assert report["summary"]["raw_attention_count"] == 0
+    assert report["ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("archived_provider", "rewritten_provider"),
+    [("token", "custom"), ("custom", "x")],
+)
+def test_codex_inode_drift_metadata_only_rewrite_is_not_raw_lag(
+    tmp_path,
+    monkeypatch,
+    archived_provider,
+    rewritten_provider,
+):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+    records[0]["payload"]["model_provider"] = archived_provider
+    session_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(first_scan["items"][0]["dest"])
+    raw_before = raw_path.read_bytes()
+    old_inode = session_path.stat().st_ino
+
+    records[0]["payload"]["model_provider"] = rewritten_provider
+    replacement = session_path.with_suffix(".replacement")
+    replacement.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    os.replace(replacement, session_path)
+    assert session_path.stat().st_ino != old_inode
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="full",
+        public=False,
+        source_systems=["codex"],
+    )
+
+    item = report["records"][0]
+    assert item["guard_status"] == "source_divergence_metadata_only_raw_retained"
+    assert item["sync"]["raw_source_divergence"] is True
+    assert item["sync"]["raw_metadata_only_divergence"] is True
+    assert item["sync"]["raw_archive_lag_bytes"] == 0
+    assert item["sync"]["raw_size_delta_bytes"] == abs(
+        len(rewritten_provider) - len(archived_provider)
+    )
+    assert item["sync"]["raw_source_regression"] is False
+    assert item["sync"]["metadata_only_fields"] == ["payload.model_provider"]
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["raw_lagging_or_missing_count"] == 0
+    assert report["summary"]["raw_metadata_only_divergence_count"] == 1
+    assert report["summary"]["max_raw_lag_bytes"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+    assert raw_path.read_bytes() == raw_before
+
+    snapshot = codex_local_connector.raw_sync_snapshot(limit=20)
+    assert snapshot["status"] == "raw_current_metadata_divergence_retained"
+    assert snapshot["raw_source_divergence_count"] == 0
+    assert snapshot["raw_metadata_only_divergence_count"] == 1
+    assert snapshot["raw_overrun_count"] == 0
+    assert snapshot["missing_or_stale_count"] == 0
+
+
+def test_lost_source_non_conversation_layout_variants_are_one_logical_record(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    raw_path, _source_path = _write_claude_desktop_authorized_raw(
+        tmp_path,
+        monkeypatch,
+        source_exists=False,
+    )
+    source_ref = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])["source_refs"]
+    non_conversation = [
+        {
+            "type": "response_item",
+            "payload": {"type": "authorized_local_store_record", "record_id": f"item-{index}"},
+            "source_refs": source_ref,
+        }
+        for index in (1, 2)
+    ]
+    raw_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in non_conversation),
+        encoding="utf-8",
+    )
+    legacy_path = raw_path.parents[1] / "claude_desktop" / raw_path.name
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_bytes(raw_path.read_bytes())
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["claude_desktop"],
+    )
+
+    assert report["summary"]["physical_record_count"] == 2
+    assert report["summary"]["logical_record_count"] == 1
+    assert report["summary"]["layout_variant_count"] == 1
+    assert report["summary"]["lost_source_count"] == 1
+    assert report["summary"]["lost_source_recoverable_count"] == 1
+    assert report["summary"]["lost_source_non_conversation_count"] == 1
+    assert report["summary"]["lost_source_unrecoverable_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+    assert len(report["records"]) == 2
+    assert {item["logical_variant_count"] for item in report["records"]} == {2}
+    assert {item["recoverability_class"] for item in report["records"]} == {
+        "non_conversation_structurally_valid"
+    }
+    assert all(item["recoverable_from_raw"] is True for item in report["records"])
+
+
+def test_lost_source_user_only_entrypoint_is_measured_one_sided_not_unrecoverable(tmp_path, monkeypatch):
+    import raw_record_guardian
+
+    raw_path, source_path, _session_id = _write_claude_desktop_projects_jsonl_raw(
+        tmp_path,
+        monkeypatch,
+    )
+    first_line = raw_path.read_text(encoding="utf-8").splitlines()[0]
+    raw_path.write_text(first_line + "\n", encoding="utf-8")
+    source_path.unlink()
+    raw_record_guardian._RECOVERABILITY_CACHE.clear()
+
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["claude_desktop"],
+    )
+
+    item = report["records"][0]
+    assert item["recoverability_class"] == "conversation_one_sided"
+    assert item["recoverability_status"] == "measured_recoverable_one_sided"
+    assert item["recoverable_from_raw"] is True
+    assert item["guard_status"] == "authorized_raw_one_sided_source_missing"
+    assert report["summary"]["lost_source_count"] == 1
+    assert report["summary"]["lost_source_one_sided_count"] == 1
+    assert report["summary"]["lost_source_unrecoverable_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+
+
+def test_targeted_guardian_reuses_fresh_divergence_witness_without_discovery(tmp_path, monkeypatch):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(first_scan["items"][0]["dest"])
+    raw_before = raw_path.read_bytes()
+    artifact = codex_local_connector.artifact_from_path(session_path)
+
+    original = session_path.read_bytes()
+    assert "守".encode("utf-8") in original
+    rewritten = original.replace("守".encode("utf-8"), "改".encode("utf-8"), 1)
+    assert len(rewritten) == len(original)
+    session_path.write_bytes(rewritten)
+
+    generation_dest, status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    generation_raw = Path(generation_dest)
+    assert status.startswith("generation_started")
+    assert generation_raw != raw_path
+    sync_item = codex_local_connector._raw_sync_item(artifact)
+    assert sync_item["raw_source_divergence"] is True
+    assert sync_item["raw_divergence_generation_active"] is True
+    assert sync_item["raw_monotonic_status"] == "source_divergence_generation_active"
+
+    def discovery_must_not_run(*_args, **_kwargs):
+        raise AssertionError("targeted guardian performed full session discovery")
+
+    monkeypatch.setattr(codex_local_connector, "discover_sessions", discovery_must_not_run)
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+        connector_artifacts={"codex": [artifact]},
+    )
+
+    assert len(report["records"]) == 1
+    assert report["records"][0]["guard_status"] == "source_divergence_generation_active"
+    assert report["records"][0]["sync"]["raw_body_read_performed"] is False
+    assert report["summary"]["raw_source_divergence_count"] == 1
+    assert report["summary"]["raw_divergence_generation_active_count"] == 1
+    assert report["summary"]["backfill_recommended_count"] == 0
+    assert raw_path.read_bytes() == raw_before
 
 
 def test_raw_record_guardian_guards_kiro_json_source_after_connector_scan(tmp_path, monkeypatch):

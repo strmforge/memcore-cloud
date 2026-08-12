@@ -14,12 +14,12 @@
 
 <p align="center">
   <a href="README.zh-CN.md">简体中文</a> ·
-  <a href="https://github.com/strmforge/time-library/releases/tag/v2026.7.18">2026.7.18</a> ·
+  <a href="https://github.com/strmforge/time-library/releases">2026.8.7 candidate</a> ·
   <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-2026.7.18-2f5f9b">
+  <img alt="Version" src="https://img.shields.io/badge/version-2026.8.7-2f5f9b">
   <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-ready-247447">
   <img alt="Local first" src="https://img.shields.io/badge/local--first-memory-b07d35">
 </p>
@@ -196,8 +196,9 @@ The installer adds the workflow skill where skills are supported, registers `tim
 
 ## Quick Install
 
-2026.7.18 is the current published release. Download the release zip or use
-the versioned install scripts from GitHub Releases.
+2026.8.7 is the current release candidate. The latest published release is
+2026.7.18; use the published 7.18 installer URLs below until this candidate is
+published.
 
 macOS / Linux:
 
@@ -315,14 +316,16 @@ Supported local AI tool entries can be connected automatically. Conversation imp
 - **Claude is handled carefully**: Claude Desktop and Claude Code CLI can both connect, but they remain separate surfaces. Official, relay, and CLI-related records keep attribution boundaries.
 - **Hermes can inspect sources itself**: Time Library can provide raw/source-ref pointers and observe native feedback, while Hermes-owned skill changes remain Hermes-owned.
 
-## Current Release: 2026.7.18
+## Current Release Candidate: 2026.8.7
 
-2026.7.18 is the current published release. It improves local setup and
-connection reliability, simplifies the local service entry point, and adds
-clearer local visibility into model-assisted processing. Legacy `memcore-cloud` roots remain migration and uninstall
-fallbacks so existing local data is preserved.
+2026.8.7 strengthens source-preserving record reliability, bounded recoverability
+diagnostics, and unattended Guardian task handling while retaining the
+fail-closed, relay-preserving Codex MCP guard and watcher from 2026.7.25. The
+local setup, front-door, archive, and transparency boundaries from the
+published 2026.7.18 release remain in place. Legacy `memcore-cloud` roots
+remain migration and uninstall fallbacks so existing local data is preserved.
 
-See [RELEASE_NOTES_2026.7.18.md](RELEASE_NOTES_2026.7.18.md) for this release,
+See [RELEASE_NOTES_2026.8.7.md](RELEASE_NOTES_2026.8.7.md) for this candidate,
 [UPDATE_HISTORY.md](UPDATE_HISTORY.md) for older highlights, and
 [CHANGELOG.md](CHANGELOG.md) for lower-level changes.
 

@@ -4135,7 +4135,7 @@ input,
   max-width: none;
 }
 .morning-board {
-  grid-template-columns: minmax(430px, 0.88fr) minmax(390px, 0.86fr) minmax(430px, 0.94fr);
+  grid-template-columns: minmax(0, 0.88fr) minmax(0, 0.86fr) minmax(0, 0.94fr);
 }
 .insight-tile {
   min-height: 206px;
@@ -4156,7 +4156,24 @@ input,
     grid-template-columns: 286px minmax(0, 1fr);
   }
   .morning-board {
-    grid-template-columns: minmax(460px, 0.9fr) minmax(430px, 0.86fr) minmax(470px, 0.94fr);
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.86fr) minmax(0, 0.94fr);
+  }
+}
+@media (max-width: 1499px) {
+  .morning-board {
+    grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+    grid-template-areas:
+      "report insight"
+      "tasks health"
+      "tasks recall";
+  }
+}
+@media (min-width: 1181px) and (max-width: 1380px) {
+  .screen-top {
+    grid-template-columns: 222px minmax(0, 1fr);
+  }
+  .quote-block {
+    display: none;
   }
 }
 @media (max-width: 1180px) {
@@ -4168,6 +4185,10 @@ input,
   }
   .brand-lockup {
     display: none;
+  }
+  .morning-board {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: none;
   }
 }
 </style>
@@ -4956,6 +4977,16 @@ const messages = {
     'record.notCurrent': '未跟上',
     'record.attention': '需处理',
     'record.lostSource': '遗失源',
+    'record.retainedRaw': 'Raw 已保留',
+    'record.lostSourceUnrecoverable': '不可恢复的遗失源',
+    'record.recoverabilityNotMeasured': '可恢复性未测',
+    'record.oneSidedRetained': '单边记录已保留',
+    'record.nonConversationRetained': '非会话产物已保留',
+    'record.logicalRecords': '逻辑记录',
+    'record.layoutVariants': '布局副本',
+    'record.metadataOnlyDivergence': '仅元数据分歧',
+    'record.populationComplete': '总体口径完整',
+    'record.populationSample': '总体口径为样本',
     'record.lostRaw': '遗失 raw',
     'record.backfillNeeded': '建议回填',
     'record.catchingUp': '正在追尾',
@@ -4984,8 +5015,8 @@ const messages = {
     'record.recentMessages': '最近消息',
     'record.rawAvailable': 'raw 可回源',
     'record.rawMissing': 'raw 未定位',
-    'record.lostDetailTitle': '遗失明细',
-    'record.lostDetailLead': '只列出未守住、未跟上、需回填的会话，不自动扫描写库。',
+    'record.lostDetailTitle': '记录证据明细',
+    'record.lostDetailLead': '列出已保留、未测或需处理的会话证据，不自动扫描写库。',
     'record.sourcePath': '源',
     'record.rawPath': 'Raw',
     'record.recoverable': '可从 raw 救回',
@@ -5004,6 +5035,8 @@ const messages = {
     'record.actionWait': '继续观察追尾',
     'record.actionBackfill': '可显式回填',
     'record.actionRecoverRaw': 'raw 可作为救援依据',
+    'record.actionRetainedRaw': '无需修复，raw 已保留',
+    'record.actionMeasureRecoverability': '完成有界可恢复性检查',
     'record.actionRecapture': '需要重新采集',
     'preflight.title': '开工前检查',
     'preflight.lead': '快速检查走日常热路径，完整体检只在排障或跑分时手动触发。',
@@ -5497,6 +5530,16 @@ const messages = {
     'record.notCurrent': 'Not current',
     'record.attention': 'Attention',
     'record.lostSource': 'Lost source',
+    'record.retainedRaw': 'Retained raw',
+    'record.lostSourceUnrecoverable': 'Unrecoverable lost source',
+    'record.recoverabilityNotMeasured': 'Recoverability not measured',
+    'record.oneSidedRetained': 'One-sided record retained',
+    'record.nonConversationRetained': 'Non-conversation artifact retained',
+    'record.logicalRecords': 'Logical records',
+    'record.layoutVariants': 'Layout copies',
+    'record.metadataOnlyDivergence': 'Metadata-only divergence',
+    'record.populationComplete': 'Population scope complete',
+    'record.populationSample': 'Population scope is sampled',
     'record.lostRaw': 'Lost raw',
     'record.backfillNeeded': 'Backfill needed',
     'record.catchingUp': 'Catching up',
@@ -5525,8 +5568,8 @@ const messages = {
     'record.recentMessages': 'Recent messages',
     'record.rawAvailable': 'Raw available',
     'record.rawMissing': 'Raw missing',
-    'record.lostDetailTitle': 'Lost detail',
-    'record.lostDetailLead': 'Shows sessions that are not guarded, not current, or need backfill. It does not auto-scan or write the index.',
+    'record.lostDetailTitle': 'Record evidence detail',
+    'record.lostDetailLead': 'Shows retained, unmeasured, or attention-needed session evidence; it does not auto-scan or write the index.',
     'record.sourcePath': 'Source',
     'record.rawPath': 'Raw',
     'record.recoverable': 'Recoverable from raw',
@@ -5545,6 +5588,8 @@ const messages = {
     'record.actionWait': 'Keep watching tail catch-up',
     'record.actionBackfill': 'Explicit backfill is available',
     'record.actionRecoverRaw': 'Raw can be used as rescue evidence',
+    'record.actionRetainedRaw': 'No repair needed; raw is retained',
+    'record.actionMeasureRecoverability': 'Complete the bounded recoverability check',
     'record.actionRecapture': 'Needs recapture',
     'preflight.title': 'Preflight Check',
     'preflight.lead': 'Quick check uses the daily hot path. Full check is manual for diagnosis or scoring.',
@@ -5893,22 +5938,52 @@ function healthSummaryText(health) {
   }
   return (health && (health.version || health.status)) || '127.0.0.1';
 }
+function nonNegativeMetric(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+}
+function lostSourceTriage(summary) {
+  summary = summary || {};
+  const total = nonNegativeMetric(summary.lost_source_count);
+  const keys = ['lost_source_recoverable_count', 'lost_source_unrecoverable_count', 'lost_source_not_measured_count'];
+  const complete = keys.every(function(key) { return Object.prototype.hasOwnProperty.call(summary, key); });
+  const recoverable = nonNegativeMetric(summary.lost_source_recoverable_count);
+  const unrecoverable = nonNegativeMetric(summary.lost_source_unrecoverable_count);
+  const notMeasured = nonNegativeMetric(summary.lost_source_not_measured_count);
+  const triagedTotal = recoverable + unrecoverable + notMeasured;
+  if (complete && triagedTotal === total) {
+    return {total: total, recoverable: recoverable, unrecoverable: unrecoverable, notMeasured: notMeasured, valid: true};
+  }
+  const fallback = Math.max(total, triagedTotal);
+  return {total: fallback, recoverable: 0, unrecoverable: fallback, notMeasured: 0, valid: false};
+}
 function guardianIsOk(guardian) {
   if (!guardian || typeof guardian !== 'object' || guardian.ok !== true) return false;
   const summary = guardian.summary || {};
+  const scope = guardian.summary_scope || {};
+  if (scope.summary_is_sample === true) return false;
+  const triage = lostSourceTriage(summary);
   return Number(summary.lost_raw_count || 0) === 0 &&
-    Number(summary.lost_source_count || 0) === 0 &&
+    triage.unrecoverable === 0 &&
     Number(summary.raw_attention_count || 0) === 0 &&
     Number(summary.corrupt_record_count || 0) === 0;
 }
 function guardianSummaryText(guardian) {
   if (!guardian || typeof guardian !== 'object' || !guardian.summary) return t('status.unknown');
   const summary = guardian.summary || {};
+  const scope = guardian.summary_scope || {};
+  if (scope.summary_is_sample === true) return t('record.populationSample');
+  const triage = lostSourceTriage(summary);
   const attention = Number(summary.raw_attention_count || 0);
   const lostRaw = Number(summary.lost_raw_count || 0);
-  const lostSource = Number(summary.lost_source_count || 0);
-  if (attention || lostRaw || lostSource) {
-    return 'attention=' + attention + ' · lost_raw=' + lostRaw + ' · lost_source=' + lostSource;
+  if (attention || lostRaw || triage.unrecoverable) {
+    return 'attention=' + attention + ' · lost_raw=' + lostRaw + ' · lost_source_unrecoverable=' + triage.unrecoverable;
+  }
+  if (triage.notMeasured) {
+    return t('record.recoverabilityNotMeasured') + '=' + triage.notMeasured;
+  }
+  if (triage.recoverable) {
+    return String(summary.record_guarded_count || 0) + '/' + String(summary.record_count || 0) + ' ' + t('status.ok') + ' · ' + t('record.retainedRaw') + '=' + triage.recoverable;
   }
   return String(summary.record_guarded_count || 0) + '/' + String(summary.record_count || 0) + ' ' + t('status.ok');
 }
@@ -6778,6 +6853,7 @@ function renderRecordDoctorBlock(doctor) {
   const actions = doctor.next_actions || [];
   const ok = doctor.ok === true;
   const status = doctor.doctor_status || 'unknown';
+  const sourceTriage = lostSourceTriage(summary);
   const headline = effectiveLang() === 'en-US' ? (doctor.headline || status) : (doctor.zh_headline || doctor.headline || status);
   const checkRows = checks.map(function(item) {
     const value = typeof item.value === 'object' ? JSON.stringify(item.value) : String(item.value || 0);
@@ -6796,7 +6872,9 @@ function renderRecordDoctorBlock(doctor) {
     '<div class="mini-grid">' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.guarded')) + '</span><strong>' + esc((summary.record_guarded_count || 0) + '/' + (summary.record_count || 0)) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.canonicalMessages')) + '</span><strong>' + esc(summary.canonical_messages || 0) + '</strong></div>' +
-      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSource')) + '</span><strong>' + esc(summary.lost_source_count || 0) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.retainedRaw')) + '</span><strong>' + esc(sourceTriage.recoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSourceUnrecoverable')) + '</span><strong>' + esc(sourceTriage.unrecoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.recoverabilityNotMeasured')) + '</span><strong>' + esc(sourceTriage.notMeasured) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostRaw')) + '</span><strong>' + esc(summary.lost_raw_count || 0) + '</strong></div>' +
     '</div>' +
     '<div class="mini-grid">' + (checkRows || '<div class="note">' + esc(t('text.none')) + '</div>') + '</div>' +
@@ -7119,7 +7197,10 @@ function renderCanonicalIndexBlock(index) {
 function recordIssueKind(item) {
   const origin = item && item.origin_status;
   const guard = item && item.guard_status;
-  if (origin === 'lost_source' || guard === 'authorized_raw_recoverable_source_missing') return 'lost_source';
+  const sourceMissing = origin === 'lost_source' || String(guard || '').indexOf('source_missing') >= 0;
+  if (sourceMissing && item.recoverable_from_raw === true) return 'retained_raw';
+  if (sourceMissing && (item.recoverable_from_raw === null || item.recoverable_from_raw === undefined || item.recoverability_status === 'not_measured')) return 'recoverability_unmeasured';
+  if (sourceMissing) return 'lost_source';
   if (origin === 'lost_raw' || guard === 'raw_missing') return 'lost_raw';
   if (item && item.backfill_recommended) return 'backfill';
   if (guard === 'raw_lagging' || guard === 'raw_catching_up') return 'lagging';
@@ -7127,6 +7208,8 @@ function recordIssueKind(item) {
 }
 function recordIssueBadge(item) {
   const kind = recordIssueKind(item);
+  if (kind === 'retained_raw') return badge('ok', t('record.retainedRaw'));
+  if (kind === 'recoverability_unmeasured') return badge('neutral', t('record.recoverabilityNotMeasured'));
   if (kind === 'lost_source') return badge('warn', t('record.lostSource'));
   if (kind === 'lost_raw') return badge('warn', t('record.lostRaw'));
   if (kind === 'backfill') return badge('warn', t('record.backfillNeeded'));
@@ -7138,9 +7221,10 @@ function recordBackfillSupported(sourceSystem) {
 }
 function recordSuggestedAction(item) {
   const kind = recordIssueKind(item);
+  if (kind === 'retained_raw') return t('record.actionRetainedRaw');
+  if (kind === 'recoverability_unmeasured') return t('record.actionMeasureRecoverability');
   if (kind === 'lagging' && !item.backfill_recommended) return t('record.actionWait');
   if (item.backfill_recommended || kind === 'lost_raw') return t('record.actionBackfill');
-  if (kind === 'lost_source' && item.recoverable_from_raw) return t('record.actionRecoverRaw');
   return t('record.actionRecapture');
 }
 function diagnosticItem(label, value) {
@@ -7163,6 +7247,7 @@ function renderRecordIssueDetails(report) {
   });
   const rows = records.slice(0, 8).map(function(item) {
     const sync = item.sync || {};
+    const issueKind = recordIssueKind(item);
     const titleParts = [
       platformDisplayName(item.source_system || '-'),
       item.thread_name || item.session_id || item.raw_artifact_id || '-'
@@ -7172,14 +7257,23 @@ function renderRecordIssueDetails(report) {
       : '';
     const sourceLabel = item.source_path_label || (item.source_exists ? t('status.ok') : t('text.none'));
     const rawLabel = item.raw_path_label || (item.raw_exists ? t('status.ok') : t('text.none'));
-    const recoverable = item.recoverable_from_raw ? t('record.recoverable') : t('record.unrecoverable');
+    let recoverable = t('record.recoverabilityNotMeasured');
+    if (item.recoverability_class === 'conversation_one_sided') {
+      recoverable = t('record.oneSidedRetained');
+    } else if (item.recoverability_class === 'non_conversation_structurally_valid') {
+      recoverable = t('record.nonConversationRetained');
+    } else if (item.recoverable_from_raw === true) {
+      recoverable = t('record.recoverable');
+    } else if (item.recoverable_from_raw === false) {
+      recoverable = t('record.unrecoverable');
+    }
     const sourceExists = item.source_exists ? t('status.ok') : t('status.warn');
     const rawExists = item.raw_exists ? t('status.ok') : t('status.warn');
     const lagLabel = formatBytes(sync.raw_archive_lag_bytes || 0) + ' · ' + formatMilliseconds(sync.raw_archive_lag_milliseconds || 0);
     const supported = recordBackfillSupported(item.source_system);
-    const platformBackfillButton = supported
+    const platformBackfillButton = supported && (item.backfill_recommended || issueKind === 'lost_raw')
       ? '<button class="btn record-platform-backfill-btn" data-source-system="' + esc(item.source_system || '') + '">' + esc(t('record.backfillPlatform')) + '</button>'
-      : '<span class="note">' + esc(t('record.noBackfillForSource')) + '</span>';
+      : '<span class="note">' + esc(recordSuggestedAction(item)) + '</span>';
     const diagnostic = '<details class="record-diagnostic"><summary>' + esc(t('record.diagnostics')) + '</summary>' +
       '<div class="note">' + esc(t('record.diagnosticHint')) + '</div>' +
       '<div class="diagnostic-grid">' +
@@ -7243,6 +7337,7 @@ function renderTiandaoWorkbenchesBlock(report) {
   const platformSummary = platform.summary || {};
   const governanceSummary = governance.summary || {};
   const hermesSummary = hermes.summary || {};
+  const sourceTriage = lostSourceTriage(summary);
   const attentionCount = Number(summary.raw_attention_count || 0);
   const laggingCount = Number(summary.raw_lagging_or_missing_count || 0);
   const catchingUpCount = Number(summary.raw_catching_up_count || 0);
@@ -7258,7 +7353,9 @@ function renderTiandaoWorkbenchesBlock(report) {
       renderWorkbenchCard(hermes, t('workbench.hermesObservatory'), esc(hermesSummary.skill_file_count || 0)) +
     '</div>' +
     '<div class="mini-grid">' +
-      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSource')) + '</span><strong>' + esc(summary.lost_source_count || 0) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.retainedRaw')) + '</span><strong>' + esc(sourceTriage.recoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSourceUnrecoverable')) + '</span><strong>' + esc(sourceTriage.unrecoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.recoverabilityNotMeasured')) + '</span><strong>' + esc(sourceTriage.notMeasured) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostRaw')) + '</span><strong>' + esc(summary.lost_raw_count || 0) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('workbench.recordAttention')) + '</span><strong>' + esc(attentionCount) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('workbench.rawLagging')) + '</span><strong>' + esc(laggingCount) + '</strong></div>' +
@@ -7274,13 +7371,14 @@ function renderRecordGuardianBlock(report, canonicalIndex) {
     return '<div class="panel"><h3>' + esc(t('record.guardTitle')) + '</h3><div class="note">' + esc(t('status.unknown')) + '</div></div>';
   }
   const summary = report.summary || {};
+  const scope = report.summary_scope || {};
   const gaps = report.gaps || [];
   const notCurrent = Number(summary.raw_not_current_count || 0);
   const attention = Number(summary.raw_attention_count || summary.raw_lagging_or_missing_count || 0);
   const backfillNeeded = Number(summary.backfill_recommended_count || 0);
   const guarded = Number(summary.record_guarded_count || 0);
   const originCount = Number(summary.origin_event_count || summary.origin_witnessed_count || 0);
-  const lostSource = Number(summary.lost_source_count || 0);
+  const sourceTriage = lostSourceTriage(summary);
   const lostRaw = Number(summary.lost_raw_count || 0);
   const total = Number(summary.record_count || (report.records || []).length || 0);
   const maxLagBytes = Number(summary.max_raw_lag_bytes || 0);
@@ -7290,14 +7388,21 @@ function renderRecordGuardianBlock(report, canonicalIndex) {
   const gapText = gaps.length
     ? gaps.slice(0, 4).map(function(item) { return platformDisplayName(item.source_system || item.source || item.name || ''); }).join(', ')
     : t('text.none');
-  const status = attention > 0 || backfillNeeded > 0 ? 'pending' : 'active';
+  const status = attention > 0 || backfillNeeded > 0 || sourceTriage.unrecoverable > 0 || lostRaw > 0 || scope.summary_is_sample === true ? 'pending' : 'active';
   return '<div class="panel" id="record-guardian-panel">' +
     '<div class="section-head"><div><h3>' + esc(t('record.guardTitle')) + '</h3><p class="note">' + esc(t('record.guardLead')) + '</p></div>' +
     '<button class="btn" id="record-backfill-btn" ' + (canBackfill ? '' : 'disabled') + '>' + esc(t('record.backfill')) + '</button></div>' +
     '<div class="mini-grid">' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.guarded')) + '</span><strong>' + esc(guarded + '/' + total) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.logicalRecords')) + '</span><strong>' + esc(summary.logical_record_count || total) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.layoutVariants')) + '</span><strong>' + esc(summary.layout_variant_count || 0) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.timeOrigin')) + '</span><strong>' + esc(originCount) + '</strong></div>' +
-      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSource')) + '</span><strong>' + esc(lostSource) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.retainedRaw')) + '</span><strong>' + esc(sourceTriage.recoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostSourceUnrecoverable')) + '</span><strong>' + esc(sourceTriage.unrecoverable) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.recoverabilityNotMeasured')) + '</span><strong>' + esc(sourceTriage.notMeasured) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.oneSidedRetained')) + '</span><strong>' + esc(summary.lost_source_one_sided_count || 0) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.nonConversationRetained')) + '</span><strong>' + esc(summary.lost_source_non_conversation_count || 0) + '</strong></div>' +
+      '<div class="mini-card"><span class="metric-label">' + esc(t('record.metadataOnlyDivergence')) + '</span><strong>' + esc(summary.raw_metadata_only_divergence_count || 0) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.lostRaw')) + '</span><strong>' + esc(lostRaw) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.attention')) + '</span><strong>' + esc(attention) + '</strong></div>' +
       '<div class="mini-card"><span class="metric-label">' + esc(t('record.notCurrent')) + '</span><strong>' + esc(notCurrent) + '</strong></div>' +
@@ -7306,6 +7411,7 @@ function renderRecordGuardianBlock(report, canonicalIndex) {
 	    renderCanonicalIndexBlock(canonicalIndex) +
 	    renderRecordIssueDetails(report) +
 	    renderClaudeDesktopEvidenceBlock(report) +
+	    row(scope.summary_is_sample === true ? t('record.populationSample') : t('record.populationComplete'), scope.trend_comparison_key ? String(scope.trend_comparison_key).slice(0, 12) : '-', scope.summary_is_sample === true ? 'pending' : 'active') +
 	    row(t('record.catchingUp'), String(catchingUp), catchingUp ? 'pending' : 'active') +
     row(t('record.maxLag'), formatBytes(maxLagBytes) + ' · ' + formatMilliseconds(maxLagMs), status) +
     row(t('record.gaps'), gapText, gaps.length ? 'pending' : 'active') +

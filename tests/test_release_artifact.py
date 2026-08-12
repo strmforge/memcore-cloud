@@ -66,6 +66,7 @@ def test_release_artifact_working_tree_package_excludes_ignored_runtime_data(tmp
     assert any(name.endswith("/VERSION") for name in names)
     assert "Copyright (c) 2026 Time Library contributors" in license_text
     assert not any(name.endswith("/tools/build_release_artifact.py") for name in names)
+    assert any(name.endswith("/tools/build_fts5_recall_index.py") for name in names)
     assert any(name.endswith("/tools/runtime_profile.py") for name in names)
     assert any(name.endswith("/config/memcore.json") for name in names)
     assert any(name.endswith("/config/default_model_config.json") for name in names)
@@ -77,6 +78,7 @@ def test_release_artifact_working_tree_package_excludes_ignored_runtime_data(tmp
     assert any(name.endswith("/tools/install_runtime_identity.py") for name in names)
     assert any(name.endswith("/tools/install_runtime_quiescence.py") for name in names)
     assert any(name.endswith("/tools/install_transaction_snapshot.py") for name in names)
+    assert any(name.endswith("/tools/codex_mcp_config_guard.py") for name in names)
     assert any(name.endswith("/tools/configure_codex_mcp_policy.py") for name in names)
     assert any(name.endswith("/tools/distill_transparency.py") for name in names)
     assert any(name.endswith("/tools/install_state_migrate.py") for name in names)
@@ -114,6 +116,7 @@ def test_release_artifact_working_tree_package_excludes_ignored_runtime_data(tmp
     assert not any(name.endswith("/tools/code_change_tiandao_audit.py") for name in names)
     assert not any(name.endswith("/tools/time_twin_star_turn_loop_probe.py") for name in names)
     assert not any(name.endswith("/tools/time_twin_star_turn_loop_trace_gate.py") for name in names)
+    assert not any(name.endswith("/tools/time_library_fleet_probe.py") for name in names)
     assert not any("/benchmarks/cache/" in name for name in names)
     assert not any("/benchmarks/eval-runs/" in name for name in names)
     assert not any("/benchmarks/results/" in name for name in names)

@@ -54,6 +54,7 @@ $NodeName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "windows-local" 
 $HermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }
 $CodexSkillStatus = "pending"
 $CodexMcpStatus = "pending"
+$CodexMcpGuardStatus = "pending"
 $ClaudeCodeMcpStatus = "pending"
 $ClaudeCodeHookStatus = "pending"
 $ClaudeDesktopStatus = "pending"
@@ -372,6 +373,7 @@ function Get-RuntimeRoleDefinitions {
         [pscustomobject]@{ Role = "raw-gateway"; Entrypoint = (Join-Path $Root "src\raw_consumption_gateway.py") },
         [pscustomobject]@{ Role = "dialog-entry"; Entrypoint = (Join-Path $Root "src\dialog_entry_proxy.py") },
         [pscustomobject]@{ Role = "front-door"; Entrypoint = (Join-Path $Root "src\single_port_runtime.py") },
+        [pscustomobject]@{ Role = "codex-mcp-guard"; Entrypoint = (Join-Path $Root "tools\codex_mcp_config_guard.py") },
         [pscustomobject]@{ Role = "guardian"; Entrypoint = (Join-Path $Root "tools\windows_guardian.ps1") },
         [pscustomobject]@{ Role = "tray"; Entrypoint = (Join-Path $Root "tools\windows_tray.ps1") }
     )
@@ -479,7 +481,7 @@ function Stop-OldProcesses {
 }
 
 function Get-ManagedScheduledTaskNames {
-    return @("MemcoreCloudGuardianLogon", "MemcoreCloudGuardianHealth", "MemcoreCloudTray")
+    return @("MemcoreCloudGuardianLogon", "MemcoreCloudGuardianHealth", "MemcoreCloudCodexMcpGuard", "MemcoreCloudTray")
 }
 
 function Get-ManagedScheduledTasks {
@@ -501,6 +503,24 @@ function Unregister-MemcoreScheduledTasks {
     }
 }
 
+function Restore-PreviousCodexMcpGuardTask {
+    if ($CodexMcpGuardStatus -eq "installed") { return }
+    $snapshots = @($ScheduledTaskSnapshots | Where-Object { $_.TaskName -eq "MemcoreCloudCodexMcpGuard" })
+    if ($snapshots.Count -eq 0) { return }
+    if ($snapshots.Count -ne 1) {
+        Die "Codex MCP guard task snapshot is duplicated; refusing to choose one"
+    }
+    $snapshot = $snapshots[0]
+    Register-ScheduledTask -TaskName $snapshot.TaskName -Xml $snapshot.Xml -Force -ErrorAction Stop | Out-Null
+    if (-not [bool]$snapshot.Enabled) {
+        Disable-ScheduledTask -TaskName $snapshot.TaskName -ErrorAction Stop | Out-Null
+    }
+    if ([bool]$snapshot.Enabled -and ([string]$snapshot.State -eq "Running")) {
+        Start-ScheduledTask -TaskName $snapshot.TaskName -ErrorAction Stop
+    }
+    Info "Preserved existing Codex MCP config guard task after registration status: $CodexMcpGuardStatus"
+}
+
 function Test-ScheduledTaskTargetsInstallRoot {
     param($Task, [string]$Root = $InstallRoot)
     $allowedRoots = @($Root)
@@ -510,6 +530,7 @@ function Test-ScheduledTaskTargetsInstallRoot {
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
         $knownEntrypoints.Add((Join-Path $root "tools\windows_hidden_guardian.vbs"))
         $knownEntrypoints.Add((Join-Path $root "tools\windows_guardian.ps1"))
+        $knownEntrypoints.Add((Join-Path $root "tools\codex_mcp_config_guard.py"))
         $knownEntrypoints.Add((Join-Path $root "tools\windows_tray.ps1"))
     }
     foreach ($action in @($Task.Actions)) {
@@ -736,9 +757,13 @@ function Ensure-DialogEntryToken {
 function Remove-Tree {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return }
-    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $Path) {
-        & $env:ComSpec /c "rmdir /s /q `"$Path`"" | Out-Null
+    $maxAttempts = 20
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt += 1) {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $Path)) { return }
+        & $env:ComSpec /c "rmdir /s /q `"$Path`"" 2>$null | Out-Null
+        if (-not (Test-Path $Path)) { return }
+        if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds 250 }
     }
     if (Test-Path $Path) { Die "failed to remove $Path" }
 }
@@ -764,6 +789,7 @@ function Write-Config {
     Copy-ConfigTemplate -Name "default_model_config.json" -Target "model_config.json"
     Copy-ConfigTemplate -Name "default_feature_flags.json" -Target "feature_flags.json"
     Copy-ConfigTemplate -Name "default_alias_map.json" -Target "alias_map.json"
+    Copy-ConfigTemplate -Name "default_window_binding_registry.json" -Target "window_binding_registry.json"
 
     $cfgPath = Join-Path $InstallRoot "config\memcore.json"
     $cfg = [ordered]@{}
@@ -972,6 +998,7 @@ function Begin-InstallCutover {
     foreach ($snapshot in $ScheduledTaskSnapshots) {
         if ($snapshot.State -ne "Running") { continue }
         if ($snapshot.TaskName -eq "MemcoreCloudTray") { $roles.Add("task:MemcoreCloudTray") }
+        if ($snapshot.TaskName -eq "MemcoreCloudCodexMcpGuard") { $roles.Add("task:MemcoreCloudCodexMcpGuard") }
         if ($snapshot.TaskName -in @("MemcoreCloudGuardianLogon", "MemcoreCloudGuardianHealth")) {
             $roles.Add("task:$($snapshot.TaskName)")
         }
@@ -1215,61 +1242,59 @@ function Install-CodexSkill {
 function Install-CodexMcp {
     if ($SkipCodex) {
         $script:CodexMcpStatus = "skipped"
-        return
-    }
-    $codexExe = Find-CodexCli
-    if (-not $codexExe) {
-        Warn "Codex CLI not found; skipping Codex MCP registration"
-        $script:CodexMcpStatus = "codex CLI not found"
+        $script:CodexMcpGuardStatus = "skipped"
         return
     }
     $python = Get-RuntimePython
     if (-not $python) {
         Warn "Runtime Python not found; skipping Codex MCP registration"
         $script:CodexMcpStatus = "runtime python not found"
+        $script:CodexMcpGuardStatus = "runtime python not found"
         return
     }
     $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+    $codexConfig = Join-Path $codexHome "config.toml"
+    $codexExe = Find-CodexCli
+    if ((-not (Test-Path -LiteralPath $codexConfig)) -and (-not $codexExe)) {
+        Warn "Codex CLI/config not found; skipping Codex MCP registration and guard"
+        $script:CodexMcpStatus = "Codex not detected"
+        $script:CodexMcpGuardStatus = "Codex not detected"
+        return
+    }
     $bridge = Join-Path $InstallRoot "tools\codex_mcp_bridge.py"
-    $policyHelper = Join-Path $InstallRoot "tools\configure_codex_mcp_policy.py"
-    $registryPath = Join-Path $InstallRoot "config\window_binding_registry.json"
+    $guard = Join-Path $InstallRoot "tools\codex_mcp_config_guard.py"
     if (-not (Test-Path $bridge)) {
         Warn "Codex MCP bridge not found: $bridge"
         $script:CodexMcpStatus = "bridge not found"
+        $script:CodexMcpGuardStatus = "bridge not found"
+        return
+    }
+    if (-not (Test-Path $guard)) {
+        Warn "Codex MCP config guard not found: $guard"
+        $script:CodexMcpStatus = "guard not found"
+        $script:CodexMcpGuardStatus = "guard not found"
         return
     }
     try {
-        & $codexExe mcp remove time-library *> $null
-    } catch { }
-    try {
-        & $codexExe mcp add time-library `
-            --env "PYTHONIOENCODING=utf-8" `
-            --env "PYTHONUTF8=1" `
-            --env "MEMCORE_ROOT=$InstallRoot" `
-            --env "MEMCORE_WINDOW_BINDING_REGISTRY=$registryPath" `
-            -- $python $bridge `
-                --timeout "30" `
-                --window-binding-registry $registryPath `
-                --binding-key "codex" *> $null
+        & $python $guard `
+            --once `
+            --config $codexConfig `
+            --install-root $InstallRoot `
+            --python-executable $python `
+            --create-if-missing *> $null
         if ($LASTEXITCODE -eq 0) {
-            $codexConfig = Join-Path $codexHome "config.toml"
-            if (Test-Path $policyHelper) {
-                & $python $policyHelper --config $codexConfig *> $null
-            }
-            if ((Test-Path $policyHelper) -and ($LASTEXITCODE -eq 0)) {
-                Info "Codex MCP registered with scoped recall/ack approval: time-library via $bridge"
-                $script:CodexMcpStatus = "time-library"
-            } else {
-                Warn "Codex MCP registered, but scoped recall/ack approval policy could not be applied"
-                $script:CodexMcpStatus = "time-library (approval policy warning)"
-            }
+            Info "Codex MCP registered with protected relay-preserving guard: time-library via $bridge"
+            $script:CodexMcpStatus = "time-library (guarded)"
+            $script:CodexMcpGuardStatus = "installed"
         } else {
-            Warn "Codex MCP registration failed; Codex users can run: codex mcp add time-library -- python $bridge"
+            Warn "Codex MCP registration failed; existing host configuration and guard were left unchanged"
             $script:CodexMcpStatus = "registration failed"
+            $script:CodexMcpGuardStatus = "registration failed"
         }
     } catch {
-        Warn "Codex MCP registration failed; Codex users can run: codex mcp add time-library -- python $bridge"
+        Warn "Codex MCP registration failed; existing host configuration and guard were left unchanged"
         $script:CodexMcpStatus = "registration failed"
+        $script:CodexMcpGuardStatus = "registration failed"
     }
 }
 
@@ -1502,6 +1527,40 @@ print(str(cfg_path))
     }
 }
 
+function Set-CanonicalStartedServicePid {
+    param(
+        [string]$Name,
+        [string]$PidPath
+    )
+    if ($Name -eq "p0-watcher") { return }
+    $venvPython = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot ".venv\Scripts\python.exe"))
+    for ($attempt = 0; $attempt -lt 20; $attempt += 1) {
+        $records = @(Get-OwnedInstallProcessRecords -Root $InstallRoot | Where-Object { $_.Role -eq $Name })
+        $candidates = @($records | ForEach-Object { $_.Process } | Where-Object {
+            $path = [string]$_.ExecutablePath
+            (-not [string]::IsNullOrWhiteSpace($path)) -and
+            ([System.IO.Path]::GetFullPath($path).Equals($venvPython, [System.StringComparison]::OrdinalIgnoreCase))
+        } | Sort-Object ProcessId)
+        if ($candidates.Count -gt 0) {
+            $canonical = $candidates[0]
+            Set-Content -LiteralPath $PidPath -Value ([string]$canonical.ProcessId) -Encoding ASCII
+            try {
+                $started = if ($canonical.CreationDate -is [DateTime]) {
+                    ([DateTime]$canonical.CreationDate).ToUniversalTime()
+                } else {
+                    [System.Management.ManagementDateTimeConverter]::ToDateTime(
+                        [string]$canonical.CreationDate
+                    ).ToUniversalTime()
+                }
+                [System.IO.File]::SetLastWriteTimeUtc($PidPath, $started)
+            } catch { }
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    Warn "could not canonicalize $Name PID to the installed venv worker; Guardian will keep fail-closed detection"
+}
+
 function Start-MemcoreService {
     param(
         [string]$Name,
@@ -1549,7 +1608,9 @@ function Start-MemcoreService {
     $command = "$env:ComSpec /c `"`"$cmdPath`"`""
     $result = ([WMIClass]"Win32_Process").Create($command, $InstallRoot, $startup)
     if ($result.ReturnValue -ne 0) { Die "failed to start $Name via WMI, code $($result.ReturnValue)" }
-    Set-Content -Path (Join-Path $runtime "$Name.pid") -Value $result.ProcessId -Encoding ASCII
+    $pidPath = Join-Path $runtime "$Name.pid"
+    Set-Content -Path $pidPath -Value $result.ProcessId -Encoding ASCII
+    Set-CanonicalStartedServicePid -Name $Name -PidPath $pidPath
     Info "Started $Name (PID $($result.ProcessId))"
 }
 
@@ -1577,6 +1638,7 @@ function Start-RuntimeRole {
         "front-door" { Start-MemcoreService -Name "front-door" -ArgLine "-u `"$(Join-Path $InstallRoot 'src\single_port_runtime.py')`" --host 127.0.0.1 --preferred-port $FrontDoorPort" }
         "task:MemcoreCloudGuardianLogon" { Start-RestoredScheduledTask -TaskName "MemcoreCloudGuardianLogon" }
         "task:MemcoreCloudGuardianHealth" { Start-RestoredScheduledTask -TaskName "MemcoreCloudGuardianHealth" }
+        "task:MemcoreCloudCodexMcpGuard" { Start-RestoredScheduledTask -TaskName "MemcoreCloudCodexMcpGuard" }
         "task:MemcoreCloudTray" { Start-RestoredScheduledTask -TaskName "MemcoreCloudTray" }
         "guardian" { Start-RestoredScheduledTask -TaskName "MemcoreCloudGuardianHealth" }
         "tray" { Start-RestoredScheduledTask -TaskName "MemcoreCloudTray" }
@@ -1600,7 +1662,7 @@ function Start-RuntimeRoles {
     foreach ($role in @(
         "p0-watcher", "p3-recall", "p4-provider", "p6-console",
         "raw-gateway", "dialog-entry", "front-door",
-        "task:MemcoreCloudGuardianLogon", "task:MemcoreCloudGuardianHealth", "task:MemcoreCloudTray",
+        "task:MemcoreCloudGuardianLogon", "task:MemcoreCloudGuardianHealth", "task:MemcoreCloudCodexMcpGuard", "task:MemcoreCloudTray",
         "guardian", "tray"
     )) {
         if ($role -in $requested) { Start-RuntimeRole -Role $role }
@@ -1612,6 +1674,216 @@ function Start-Services {
         "p0-watcher", "p3-recall", "p4-provider", "p6-console",
         "raw-gateway", "dialog-entry", "front-door"
     )
+}
+
+function Get-BackgroundScheduledTaskRunSample {
+    param([string]$TaskName)
+
+    $taskBefore = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+    $taskAfter = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $stateBefore = [string]$taskBefore.State
+    $stateAfter = [string]$taskAfter.State
+    return [pscustomobject]@{
+        ReadStable = ($stateBefore -eq $stateAfter)
+        ObservedRunning = ($stateBefore -eq "Running") -or ($stateAfter -eq "Running")
+        State = $stateAfter
+        LastRunTime = [datetime]$info.LastRunTime
+        LastTaskResult = [uint32]$info.LastTaskResult
+    }
+}
+
+function Test-BackgroundScheduledTaskRunSampleEqual {
+    param([object]$Left, [object]$Right)
+    if (($null -eq $Left) -or ($null -eq $Right)) { return $false }
+    return (
+        ([string]$Left.State -eq [string]$Right.State) -and
+        ([datetime]$Left.LastRunTime -eq [datetime]$Right.LastRunTime) -and
+        ([uint32]$Left.LastTaskResult -eq [uint32]$Right.LastTaskResult)
+    )
+}
+
+function Get-BackgroundScheduledTaskRunDecision {
+    param(
+        [datetime]$BeforeRun,
+        [bool]$BaselineRunObserved,
+        [bool]$RunObserved,
+        [object]$PreviousSample,
+        [object]$CurrentSample
+    )
+    if (($null -eq $CurrentSample) -or (-not [bool]$CurrentSample.ReadStable)) { return "wait" }
+    if (-not (Test-BackgroundScheduledTaskRunSampleEqual -Left $PreviousSample -Right $CurrentSample)) { return "wait" }
+    if ([string]$CurrentSample.State -eq "Disabled") { return "disabled" }
+    if (-not $RunObserved) { return "wait" }
+    if ([string]$CurrentSample.State -in @("Running", "Queued")) { return "wait" }
+    if ([datetime]$CurrentSample.LastRunTime -lt $BeforeRun) { return "wait" }
+    if (([datetime]$CurrentSample.LastRunTime -eq $BeforeRun) -and (-not $BaselineRunObserved)) { return "wait" }
+    if ([uint32]$CurrentSample.LastTaskResult -eq 0) { return "success" }
+    return "failed"
+}
+
+function Stop-BackgroundScheduledTaskRun {
+    param(
+        [string]$TaskName,
+        [int]$TimeoutSeconds = 30
+    )
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop } catch { }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        } catch {
+            return $false
+        }
+        if (-not $task) { return $false }
+        if ([string]$task.State -notin @("Running", "Queued")) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Assert-BackgroundScheduledTaskRun {
+    param(
+        [string]$TaskName,
+        [int]$TimeoutSeconds = 600
+    )
+
+    $beforeSample = Get-BackgroundScheduledTaskRunSample -TaskName $TaskName
+    $beforeRun = [datetime]$beforeSample.LastRunTime
+    $baselineRunObserved = [bool]$beforeSample.ObservedRunning
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch {
+        if (-not $baselineRunObserved) {
+            $stopped = Stop-BackgroundScheduledTaskRun -TaskName $TaskName
+            $cleanup = if ($stopped) { "" } else { " Task stop could not be confirmed." }
+            Die "Background task $TaskName could not be started: $($_.Exception.Message).$cleanup"
+        }
+        Info "Background task $TaskName was already Running/Queued before demand-start; monitoring that registered instance"
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $runObserved = $baselineRunObserved
+    $previousSample = $null
+    $sample = $beforeSample
+    $decision = "wait"
+    $samplingFailure = ""
+    try {
+        while ((Get-Date) -lt $deadline) {
+            $sample = Get-BackgroundScheduledTaskRunSample -TaskName $TaskName
+            $runObserved = $runObserved -or [bool]$sample.ObservedRunning -or ([datetime]$sample.LastRunTime -gt $beforeRun)
+            $decision = Get-BackgroundScheduledTaskRunDecision `
+                -BeforeRun $beforeRun `
+                -BaselineRunObserved $baselineRunObserved `
+                -RunObserved $runObserved `
+                -PreviousSample $previousSample `
+                -CurrentSample $sample
+            if ($decision -ne "wait") { break }
+            $previousSample = if ([bool]$sample.ReadStable) { $sample } else { $null }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        $samplingFailure = $_.Exception.Message
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($samplingFailure)) {
+        $stopped = Stop-BackgroundScheduledTaskRun -TaskName $TaskName
+        $cleanup = if ($stopped) { "" } else { " Task stop could not be confirmed." }
+        Die "Background task $TaskName sampling failed after start: $samplingFailure.$cleanup"
+    }
+
+    $result = [uint32]$sample.LastTaskResult
+    $resultText = ("{0} (0x{1:X8})" -f [uint64]$result, [uint64]$result)
+    $diagnostic = "Check SeBatchLogonRight/SeDenyBatchLogonRight and the TaskScheduler Operational log; SCHED_S_BATCH_LOGON_PROBLEM=0x0004131C and ERROR_LOGON_TYPE_NOT_GRANTED=0x80070569."
+    if ($decision -ne "success") {
+        $stopped = Stop-BackgroundScheduledTaskRun -TaskName $TaskName
+        $cleanup = if ($stopped) { "" } else { " Task stop could not be confirmed." }
+        if ($decision -eq "disabled") {
+            Die "Background task $TaskName became Disabled before a successful run; last_result=$resultText. $diagnostic$cleanup"
+        }
+        if ($decision -eq "failed") {
+            Die "Background task $TaskName completed with last_result=$resultText. $diagnostic$cleanup"
+        }
+        if (-not $runObserved) {
+            Die "Background task $TaskName did not begin within ${TimeoutSeconds}s; last_result=$resultText. $diagnostic$cleanup"
+        }
+        Die "Background task $TaskName did not reach two stable terminal samples within ${TimeoutSeconds}s; state=$([string]$sample.State); last_result=$resultText.$cleanup"
+    }
+    Info "Background task $TaskName completed through its registered principal with last_result=$resultText"
+}
+
+function Assert-LongRunningBackgroundScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$Role,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $beforeTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $beforeInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+    $baselineProcesses = @(
+        Get-OwnedInstallProcessRecords |
+            Where-Object { [string]$_.Role -eq $Role }
+    )
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch {
+        if (([string]$beforeTask.State -ne "Running") -and ($baselineProcesses.Count -eq 0)) {
+            $stopped = Stop-BackgroundScheduledTaskRun -TaskName $TaskName
+            $cleanup = if ($stopped) { "" } else { " Task stop could not be confirmed." }
+            Die "Long-running background task $TaskName could not be started: $($_.Exception.Message). Check SeBatchLogonRight/SeDenyBatchLogonRight and the TaskScheduler Operational log; SCHED_S_BATCH_LOGON_PROBLEM=0x0004131C and ERROR_LOGON_TYPE_NOT_GRANTED=0x80070569.$cleanup"
+        }
+        Info "Long-running background task $TaskName was already active; monitoring its registered process"
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $task = $beforeTask
+    $info = $beforeInfo
+    $processes = $baselineProcesses
+    $lastError = ""
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+            $processes = @(
+                Get-OwnedInstallProcessRecords |
+                    Where-Object { [string]$_.Role -eq $Role }
+            )
+            $lastError = ""
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        if (([string]$task.State -eq "Running") -and ($processes.Count -gt 0)) {
+            Info "Long-running background task $TaskName is Running with $($processes.Count) owned $Role process(es)"
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    $stopped = Stop-BackgroundScheduledTaskRun -TaskName $TaskName
+    $cleanup = if ($stopped) { "" } else { " Task stop could not be confirmed." }
+    $result = [uint32]$info.LastTaskResult
+    $resultText = ("{0} (0x{1:X8})" -f [uint64]$result, [uint64]$result)
+    $errorText = if ([string]::IsNullOrWhiteSpace($lastError)) { "" } else { " query_error=$lastError;" }
+    Die "Long-running background task $TaskName did not reach Running with an owned $Role process within ${TimeoutSeconds}s; state=$([string]$task.State); last_result=$resultText;$errorText Check SeBatchLogonRight/SeDenyBatchLogonRight and the TaskScheduler Operational log; SCHED_S_BATCH_LOGON_PROBLEM=0x0004131C and ERROR_LOGON_TYPE_NOT_GRANTED=0x80070569.$cleanup"
+}
+
+function Get-WindowsGuardianTaskArguments {
+    param(
+        [string]$HiddenGuardian,
+        [string]$Root,
+        [bool]$SkipCodexGuardTaskCheck,
+        [bool]$StartupActivationOnly = $false
+    )
+    $arguments = "`"$HiddenGuardian`" `"$Root`""
+    if ($SkipCodexGuardTaskCheck) {
+        $arguments += " `"-SkipCodexMcpGuardTaskCheck`""
+    }
+    if ($StartupActivationOnly) {
+        $arguments += " `"-StartupActivationOnly`""
+    }
+    return $arguments
 }
 
 function Register-WindowsAutostart {
@@ -1634,7 +1906,8 @@ function Register-WindowsAutostart {
     Unregister-MemcoreScheduledTasks
 
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    $interactivePrincipal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    $backgroundPrincipal = New-ScheduledTaskPrincipal -UserId $identity -LogonType S4U -RunLevel Limited
     $guardianSettings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -1645,15 +1918,25 @@ function Register-WindowsAutostart {
         -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
     $wscriptExe = Join-Path $env:SystemRoot "System32\wscript.exe"
-    $guardianArgs = "`"$hiddenGuardian`" `"$InstallRoot`""
-    $guardianAction = New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianArgs
+    $skipCodexGuardTaskCheck = ($CodexMcpGuardStatus -ne "installed")
+    $guardianHealthArgs = Get-WindowsGuardianTaskArguments `
+        -HiddenGuardian $hiddenGuardian `
+        -Root $InstallRoot `
+        -SkipCodexGuardTaskCheck $skipCodexGuardTaskCheck
+    $guardianLogonArgs = Get-WindowsGuardianTaskArguments `
+        -HiddenGuardian $hiddenGuardian `
+        -Root $InstallRoot `
+        -SkipCodexGuardTaskCheck $false `
+        -StartupActivationOnly $true
+    $guardianLogonAction = New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianLogonArgs
+    $guardianHealthAction = New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianHealthArgs
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
     Register-ScheduledTask `
         -TaskName "MemcoreCloudGuardianLogon" `
         -Description "Time Library starts the local memory watcher at user logon." `
-        -Action $guardianAction `
+        -Action $guardianLogonAction `
         -Trigger $logonTrigger `
-        -Principal $principal `
+        -Principal $interactivePrincipal `
         -Settings $guardianSettings `
         -Force | Out-Null
 
@@ -1665,14 +1948,65 @@ function Register-WindowsAutostart {
     Register-ScheduledTask `
         -TaskName "MemcoreCloudGuardianHealth" `
         -Description "Time Library periodically checks local service health and keeps the watcher running." `
-        -Action $guardianAction `
+        -Action $guardianHealthAction `
         -Trigger $healthTrigger `
-        -Principal $principal `
+        -Principal $backgroundPrincipal `
         -Settings $guardianSettings `
         -Force | Out-Null
+
+    if ($CodexMcpGuardStatus -eq "installed") {
+        $guardPython = Get-RuntimePython
+        $guardScript = Join-Path $InstallRoot "tools\codex_mcp_config_guard.py"
+        $guardCodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+        $guardConfig = Join-Path $guardCodexHome "config.toml"
+        if ((-not $guardPython) -or (-not (Test-Path -LiteralPath $guardScript))) {
+            Die "Codex MCP guard assets are missing after registration"
+        }
+        $guardArgs = "`"$guardScript`" --watch --config `"$guardConfig`" --install-root `"$InstallRoot`" --python-executable `"$guardPython`""
+        $guardAction = New-ScheduledTaskAction -Execute $guardPython -Argument $guardArgs
+        $guardSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -MultipleInstances IgnoreNew `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero)
+        $guardLogonTrigger = New-ScheduledTaskTrigger -AtLogOn
+        $guardPeriodicTrigger = New-ScheduledTaskTrigger `
+            -Once `
+            -At (Get-Date).AddMinutes(1) `
+            -RepetitionInterval (New-TimeSpan -Minutes 5) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+        $guardTriggers = @($guardLogonTrigger, $guardPeriodicTrigger)
+        Register-ScheduledTask `
+            -TaskName "MemcoreCloudCodexMcpGuard" `
+            -Description "Time Library preserves the Codex MCP entry when another local tool rewrites config.toml." `
+            -Action $guardAction `
+            -Trigger $guardTriggers `
+            -Principal $backgroundPrincipal `
+            -Settings $guardSettings `
+            -Force | Out-Null
+        Assert-LongRunningBackgroundScheduledTask `
+            -TaskName "MemcoreCloudCodexMcpGuard" `
+            -Role "codex-mcp-guard"
+        Info "Registered Codex MCP config guard scheduled task"
+    } else {
+        Restore-PreviousCodexMcpGuardTask
+        Info "Codex MCP config guard scheduled task unchanged: $CodexMcpGuardStatus"
+    }
+
+    Assert-BackgroundScheduledTaskRun -TaskName "MemcoreCloudGuardianHealth"
     Info "Registered guardian scheduled tasks"
 
-    & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $guardian -InstallRoot $InstallRoot -StartWatcher -Backfill -Quiet
+    $guardianImmediateArgs = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $guardian,
+        "-InstallRoot", $InstallRoot, "-StartWatcher", "-Backfill", "-Quiet"
+    )
+    if ($skipCodexGuardTaskCheck) {
+        $guardianImmediateArgs += "-SkipCodexMcpGuardTaskCheck"
+    }
+    & $powershellExe @guardianImmediateArgs
     if ($LASTEXITCODE -ne 0) {
         Warn "Guardian immediate check failed; scheduled task remains registered"
     }
@@ -1697,7 +2031,7 @@ function Register-WindowsAutostart {
         -Description "Time Library tray icon for status and console access." `
         -Action $trayAction `
         -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
-        -Principal $principal `
+        -Principal $interactivePrincipal `
         -Settings $traySettings `
         -Force | Out-Null
     Info "Registered tray scheduled task"
@@ -1748,21 +2082,26 @@ function Run-NativeSmoke {
     $powershellExe = Join-Path $PSHOME "powershell.exe"
     $nativeArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$nativeSmoke`" -InstallRoot `"$InstallRoot`" -Json"
     if ($SkipCodex) { $nativeArgs += " -SkipCodex" }
+    if ($NoAutostart) { $nativeArgs += " -SkipScheduledTaskChecks" }
+    if ($CodexMcpGuardStatus -ne "installed") { $nativeArgs += " -SkipCodexGuardTaskCheck" }
 
     $maxAttempts = 4
     $lastExitCode = 1
     $lastOutput = @()
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt += 1) {
+        [string]$stdout = ""
+        [string]$stderr = ""
+        $lastPayload = $null
         $stdoutPath = Join-Path $env:TEMP ("time-library-native-smoke-" + $PID + "-" + $attempt + ".stdout.log")
         $stderrPath = Join-Path $env:TEMP ("time-library-native-smoke-" + $PID + "-" + $attempt + ".stderr.log")
         try {
             $process = Start-Process -FilePath $powershellExe -ArgumentList $nativeArgs `
                 -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
             $lastExitCode = [int]$process.ExitCode
-            [string]$stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            $stdout = if (Test-Path -LiteralPath $stdoutPath) {
                 Get-Content -LiteralPath $stdoutPath -Raw -Encoding UTF8
             } else { "" }
-            [string]$stderr = if (Test-Path -LiteralPath $stderrPath) {
+            $stderr = if (Test-Path -LiteralPath $stderrPath) {
                 Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8
             } else { "" }
             $lastOutput = @()
@@ -1776,7 +2115,64 @@ function Run-NativeSmoke {
             Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
         }
         if ($lastExitCode -eq 0) {
-            Info "Native Windows smoke passed after $attempt attempt(s)"
+            try {
+                $lastPayload = $stdout.Trim() | ConvertFrom-Json
+                $payloadFields = @($lastPayload.PSObject.Properties.Name)
+                if (
+                    ("ok" -notin $payloadFields) -or
+                    ("measurement_status" -notin $payloadFields) -or
+                    ("full_smoke" -notin $payloadFields) -or
+                    ("not_measured_layers" -notin $payloadFields)
+                ) {
+                    throw "required result fields are missing"
+                }
+                if ($lastPayload.ok -isnot [bool]) {
+                    throw "ok must be boolean"
+                }
+                if ($lastPayload.measurement_status -isnot [string]) {
+                    throw "measurement_status must be a string"
+                }
+                if ($lastPayload.full_smoke -isnot [bool]) {
+                    throw "full_smoke must be boolean"
+                }
+                if ($lastPayload.not_measured_layers -isnot [System.Array]) {
+                    throw "not_measured_layers must be an array"
+                }
+                $measurementStatus = [string]$lastPayload.measurement_status
+                $notMeasuredLayers = @($lastPayload.not_measured_layers)
+                if ($measurementStatus -notin @("complete", "partial")) {
+                    throw "measurement_status must be complete or partial"
+                }
+                if (@($notMeasuredLayers | Where-Object { ($_ -isnot [string]) -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+                    throw "not_measured_layers must contain non-empty strings"
+                }
+                if (
+                    ($measurementStatus -eq "complete") -and
+                    ((-not [bool]$lastPayload.full_smoke) -or ($notMeasuredLayers.Count -ne 0))
+                ) {
+                    throw "complete result has inconsistent measurement scope"
+                }
+                if (
+                    ($measurementStatus -eq "partial") -and
+                    ([bool]$lastPayload.full_smoke -or ($notMeasuredLayers.Count -eq 0))
+                ) {
+                    throw "partial result has inconsistent measurement scope"
+                }
+                if (-not $lastPayload.ok) {
+                    throw "result reported ok=false with exit code 0"
+                }
+            } catch {
+                $lastExitCode = 1
+                $lastOutput += "Native Windows smoke returned invalid result JSON: $($_.Exception.Message)"
+            }
+        }
+        if ($lastExitCode -eq 0) {
+            if ($measurementStatus -eq "partial") {
+                $notMeasured = ($notMeasuredLayers -join ",")
+                Warn "Native Windows smoke partial after $attempt attempt(s); measured checks passed; not measured: $notMeasured"
+            } else {
+                Info "Native Windows smoke passed after $attempt attempt(s)"
+            }
             return
         }
         foreach ($line in $lastOutput) { Write-Host ([string]$line) }
@@ -1816,13 +2212,15 @@ try {
     if ($NoStart) { Assert-NoStartRuntimeAbsent -Root $InstallRoot }
     if (-not $NoStart) {
         Start-Services
+        # Resolve the host stanza before Register-WindowsAutostart decides
+        # whether to create or preserve the long-lived Codex guard task.
+        try { Install-CodexSkill } catch { Warn "Codex skill integration failed: $($_.Exception.Message)" }
+        try { Install-CodexMcp } catch { Warn "Codex MCP integration failed: $($_.Exception.Message)" }
         Register-WindowsAutostart
         if (-not $NoSmoke) { Run-Smoke }
         if ($NoAutostart) { Restore-ScheduledTaskSnapshots }
         try { Install-OpenClawPlugin } catch { Warn "OpenClaw integration failed: $($_.Exception.Message)" }
         try { Install-HermesPlugin } catch { Warn "Hermes integration failed: $($_.Exception.Message)" }
-        try { Install-CodexSkill } catch { Warn "Codex skill integration failed: $($_.Exception.Message)" }
-        try { Install-CodexMcp } catch { Warn "Codex MCP integration failed: $($_.Exception.Message)" }
         try { Install-ClaudeCodeMcp } catch { Warn "Claude Code MCP integration failed: $($_.Exception.Message)" }
         try { Install-ClaudeCodePreflightHook } catch { Warn "Claude Code hook integration failed: $($_.Exception.Message)" }
         try { Install-ClaudeDesktopMcp } catch { Warn "Claude Desktop integration failed: $($_.Exception.Message)" }
@@ -1830,6 +2228,7 @@ try {
         Info "Host integrations and scheduled tasks preserved by -NoStart staging mode"
         $CodexSkillStatus = "skipped (-NoStart)"
         $CodexMcpStatus = "skipped (-NoStart)"
+        $CodexMcpGuardStatus = "skipped (-NoStart)"
         $ClaudeCodeMcpStatus = "skipped (-NoStart)"
         $ClaudeCodeHookStatus = "skipped (-NoStart)"
         $ClaudeDesktopStatus = "skipped (-NoStart)"
@@ -1871,6 +2270,7 @@ if ((-not $NoStart) -and (-not $NoAutostart) -and (-not $NoTray)) { Write-Host "
 Write-Host "Native smoke: powershell -ExecutionPolicy Bypass -File `"$InstallRoot\tools\windows_native_smoke.ps1`" -InstallRoot `"$InstallRoot`""
 Write-Host "Codex skill: $CodexSkillStatus"
 Write-Host "Codex MCP: $CodexMcpStatus"
+Write-Host "Codex MCP config guard: $CodexMcpGuardStatus"
 Write-Host "Claude Code MCP: $ClaudeCodeMcpStatus"
 Write-Host "Claude Code preflight hook: $ClaudeCodeHookStatus"
 Write-Host "Claude Desktop MCP: $ClaudeDesktopStatus"

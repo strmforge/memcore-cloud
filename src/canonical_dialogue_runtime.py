@@ -156,18 +156,34 @@ def _entry_for_message(
     canonical_window_id: str,
     raw_path: Path,
     native_artifact_format: str,
+    native_source_path: str,
+    source_base_offset: int,
+    generation: int,
+    predecessor: str,
 ) -> dict[str, Any]:
     content = _text(message.get("content"))
     native_id = _text(message.get("native_id"))
-    line_hash = _text(message.get("line_hash"))
+    content_hash = _text(message.get("content_hash")) or hashlib.sha256(content.encode("utf-8")).hexdigest()
+    raw_offset_start = int(message.get("offset_start") or 0)
+    raw_offset_end = int(message.get("offset_end") or 0)
+    source_offset_start = int(source_base_offset) + raw_offset_start
+    source_offset_end = int(source_base_offset) + raw_offset_end
+    timestamp = _text(message.get("timestamp"))
+    identity_anchor = (
+        f"native:{native_id}"
+        if native_id
+        else f"timestamp:{timestamp}"
+        if timestamp
+        else f"source_offset:{source_offset_start}"
+    )
     event_seed = "|".join(
         [
             source_system,
             session_id,
             canonical_window_id,
-            native_id,
-            line_hash,
-            _text(message.get("offset_start")),
+            identity_anchor,
+            _text(message.get("role")).strip().lower(),
+            content_hash,
             _text(message.get("message_index_in_record")),
         ]
     )
@@ -182,18 +198,27 @@ def _entry_for_message(
         "event_id": hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:24],
         "role": _text(message.get("role")).strip().lower(),
         "content": content,
-        "timestamp": _text(message.get("timestamp")),
+        "timestamp": timestamp,
         "verbatim_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "origin_source_ref": {
             "source_path": str(raw_path),
             "byte_offsets": {
-                "start": int(message.get("offset_start") or 0),
-                "end": int(message.get("offset_end") or 0),
+                "start": raw_offset_start,
+                "end": raw_offset_end,
             },
+            "native_source_path": native_source_path,
+            "native_source_byte_offsets": {
+                "start": source_offset_start,
+                "end": source_offset_end,
+            },
+            "source_base_offset": int(source_base_offset),
+            "generation": int(generation),
+            "predecessor": predecessor,
             "native_type": _text(message.get("native_type")),
             "native_id": native_id,
             "message_index_in_record": int(message.get("message_index_in_record") or 0),
-            "line_hash": line_hash,
+            "line_hash": _text(message.get("line_hash")),
+            "content_hash": content_hash,
         },
     }
 
@@ -257,6 +282,10 @@ def materialize_canonical_dialogue(
     native_artifact_format: str = "",
     reset: bool = False,
     raw_order: int = 1,
+    native_source_path: str | Path = "",
+    source_base_offset: int = 0,
+    generation: int = 0,
+    predecessor: str = "",
 ) -> dict[str, Any]:
     raw_file = Path(raw_path).expanduser()
     dialogue_path = canonical_dialogue_sidecar_path(raw_file)
@@ -272,8 +301,18 @@ def materialize_canonical_dialogue(
         }
 
     manifest = {} if reset else _load_manifest(manifest_path)
-    manifest_valid = bool(manifest) and "source_offset_processed" in manifest and "source_line_count_processed" in manifest
-    processed_offset = int(manifest.get("source_offset_processed") or 0)
+    manifest_valid = (
+        bool(manifest)
+        and "source_offset_processed" in manifest
+        and "source_line_count_processed" in manifest
+        and int(manifest.get("source_base_offset", 0) or 0) == int(source_base_offset or 0)
+        and int(manifest.get("generation", 0) or 0) == int(generation or 0)
+    )
+    processed_offset = int(
+        manifest.get("raw_offset_processed")
+        if manifest.get("raw_offset_processed") is not None
+        else manifest.get("source_offset_processed") or 0
+    )
     processed_lines = int(manifest.get("source_line_count_processed") or 0)
     if reset or not dialogue_path.exists() or not manifest_valid or raw_file.stat().st_size < processed_offset:
         processed_offset = 0
@@ -313,6 +352,10 @@ def materialize_canonical_dialogue(
                 canonical_window_id=canonical_window_id,
                 raw_path=raw_file,
                 native_artifact_format=native_artifact_format,
+                native_source_path=str(Path(native_source_path).expanduser()) if native_source_path else str(raw_file),
+                source_base_offset=int(source_base_offset or 0),
+                generation=int(generation or 0),
+                predecessor=str(predecessor or ""),
             )
             offset_start = handle.tell()
             _anchored_entry, encoded = _serialize_anchored_entry(
@@ -339,11 +382,16 @@ def materialize_canonical_dialogue(
         "canonical_window_id": canonical_window_id,
         "native_artifact_format": native_artifact_format,
         "raw_path": str(raw_file),
+        "native_source_path": str(Path(native_source_path).expanduser()) if native_source_path else str(raw_file),
+        "source_base_offset": int(source_base_offset or 0),
+        "source_offset_processed": int(source_base_offset or 0) + int(parsed.get("size_bytes") or raw_file.stat().st_size),
+        "generation": int(generation or 0),
+        "predecessor": str(predecessor or ""),
         "canonical_dialogue_path": str(dialogue_path),
         "cold_layer_classification": "forensic_runtime",
         "main_river_classification": "canonical_dialogue",
         "origin_policy": "canonical_dialogue_is_main_river_forensic_runtime_is_cold_layer",
-        "source_offset_processed": int(parsed.get("size_bytes") or raw_file.stat().st_size),
+        "raw_offset_processed": int(parsed.get("size_bytes") or raw_file.stat().st_size),
         "source_line_count_processed": int(parsed.get("line_count") or 0),
         "dialogue_message_count": int(manifest.get("dialogue_message_count") or 0) + kept,
         "parsed_message_count": int(manifest.get("parsed_message_count") or 0) + len(parsed.get("messages", [])),

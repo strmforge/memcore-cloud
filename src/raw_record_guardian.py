@@ -32,6 +32,10 @@ try:
 except ImportError:  # pragma: no cover
     from src.raw_archive_layout import preferred_raw_archive_path
 try:
+    import raw_record_guardian_generation as _guardian_generation
+except ImportError:  # pragma: no cover
+    from src import raw_record_guardian_generation as _guardian_generation
+try:
     from source_system_runtime_declarations import (
         declared_guarded_source_systems,
         declared_guardian_connectors,
@@ -55,6 +59,38 @@ try:
     from raw_origin_event import attach_origin_events, origin_summary
 except ImportError:  # pragma: no cover
     from src.raw_origin_event import attach_origin_events, origin_summary
+try:
+    from raw_record_recoverability import (
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_FILE_BYTES,
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_RECORD_LIMIT,
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_ROUND_BYTES,
+        RECOVERABILITY_CACHE as _RECOVERABILITY_CACHE,
+        prepare_recoverability_evidence,
+        role_content_pairs_from_record as _role_content_pairs_from_record,
+        text_from_content as _text_from_content,
+    )
+except ImportError:  # pragma: no cover
+    from src.raw_record_recoverability import (
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_FILE_BYTES,
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_RECORD_LIMIT,
+        DEFAULT_LOST_SOURCE_RECOVERABILITY_ROUND_BYTES,
+        RECOVERABILITY_CACHE as _RECOVERABILITY_CACHE,
+        prepare_recoverability_evidence,
+        role_content_pairs_from_record as _role_content_pairs_from_record,
+        text_from_content as _text_from_content,
+    )
+try:
+    import raw_record_guardian_metrics as _guardian_metrics
+except ImportError:  # pragma: no cover
+    from src import raw_record_guardian_metrics as _guardian_metrics
+_annotate_logical_records = _guardian_metrics.annotate_logical_records
+_build_summary_scope = _guardian_metrics.build_summary_scope
+_compact_records = _guardian_metrics.compact_records
+_record_population_scope = _guardian_metrics.record_population_scope
+_RECOVERABILITY_CACHE_STATUSES = _guardian_metrics.RECOVERABILITY_CACHE_STATUSES
+_RECOVERABILITY_PROBE_INT_FIELDS = _guardian_metrics.RECOVERABILITY_PROBE_INT_FIELDS
+_safe_recoverability_probe = _guardian_metrics.safe_recoverability_probe
+_summarize_records = _guardian_metrics.summarize_records
 try:
     from raw_record_canonical_index import (
         CANONICAL_RECORD_INDEX_CONTRACT,
@@ -139,6 +175,7 @@ UTC = timezone.utc
 RAW_RECORD_GUARDIAN_CONTRACT = "raw_record_guardian.v1"
 DEFAULT_JSONL_OVERSIZE_BYTES = 1024 * 1024
 DEFAULT_BACKFILL_RECOMMEND_AFTER_MS = 5000
+DEFAULT_GUARDIAN_POPULATION_LIMIT_PER_SOURCE = 2000
 CLAUDE_DESKTOP_AUTHORIZED_RAW_FORMAT = "claude_desktop_authorized_local_store_jsonl"
 CLAUDE_DESKTOP_PROJECTS_JSONL_RAW_FORMAT = "claude_projects_jsonl_desktop_entrypoint"
 LEGACY_LOCAL_RELAY_TOKEN = "cc" + "switch"
@@ -259,100 +296,8 @@ def _normalize_record_identity(item: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _text_from_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                for key in ("text", "content", "value", "markdown"):
-                    value = item.get(key)
-                    if isinstance(value, str):
-                        parts.append(value)
-                        break
-                    if isinstance(value, list):
-                        nested = _text_from_content(value)
-                        if nested:
-                            parts.append(nested)
-                            break
-        return "\n".join(part for part in parts if part)
-    if isinstance(content, dict):
-        for key in ("text", "content", "value", "markdown"):
-            value = content.get(key)
-            if isinstance(value, str):
-                return value
-            if isinstance(value, list):
-                return _text_from_content(value)
-    return ""
-
-
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-
-
-def _role_and_content_from_record(source_system: str, record: dict[str, Any]) -> tuple[str, bool]:
-    validation_kind = source_system_raw_validation_kind(source_system)
-    if validation_kind == "response_item_payload_message":
-        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        role = _safe_str(payload.get("role") or record.get("role"))
-        content = payload.get("content") if "content" in payload else record.get("content")
-        nested = payload.get("message") if isinstance(payload.get("message"), dict) else {}
-        if not role and nested:
-            role = _safe_str(nested.get("role"))
-        if content is None and nested:
-            content = nested.get("content")
-        return role, bool(_text_from_content(content).strip())
-
-    if validation_kind == "message_envelope_content_blocks":
-        rec_type = _safe_str(record.get("type"))
-        message = record.get("message") if isinstance(record.get("message"), dict) else {}
-        role = _safe_str(message.get("role") or rec_type)
-        content = message.get("content")
-        if role == "user" and isinstance(content, list) and content and all(
-            isinstance(item, dict) and _safe_str(item.get("type")) == "tool_result"
-            for item in content
-        ):
-            role = "tool"
-        return role, bool(_text_from_content(content).strip())
-
-    message = record.get("message") if isinstance(record.get("message"), dict) else {}
-    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-    role = _safe_str(record.get("role") or message.get("role") or payload.get("role"))
-    content = record.get("content")
-    if content is None:
-        content = message.get("content")
-    if content is None:
-        content = payload.get("content")
-    return role, bool(_text_from_content(content).strip())
-
-
-def _role_content_pairs_from_record(source_system: str, record: dict[str, Any]) -> list[tuple[str, bool]]:
-    if source_system_raw_validation_kind(source_system) == "message_snapshot_batch":
-        data = record.get("data") if isinstance(record.get("data"), dict) else {}
-        messages = data.get("messagesSnapshot")
-        if not isinstance(messages, list):
-            messages = record.get("messages")
-        pairs: list[tuple[str, bool]] = []
-        if isinstance(messages, list):
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                role = _safe_str(message.get("role") or message.get("type"))
-                if role == "custom":
-                    continue
-                content = message.get("content")
-                text_present = bool(_text_from_content(content).strip())
-                if role and text_present:
-                    pairs.append((role, text_present))
-            if pairs:
-                return pairs
-        final_prompt = data.get("finalPromptText")
-        if isinstance(final_prompt, str) and final_prompt.strip():
-            return [("user", True)]
-    return [_role_and_content_from_record(source_system, record)]
 
 
 def _expected_metadata(source_system: str, first_record: dict[str, Any] | None, session_seen: bool) -> dict[str, Any]:
@@ -496,6 +441,12 @@ def scan_jsonl_record(
         "path": str(raw_path),
         "path_label": _public_path_label(raw_path),
         "exists": True,
+        "file_identity": {
+            "device": int(stat.st_dev),
+            "inode": int(stat.st_ino),
+            "size_bytes": int(stat.st_size),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        },
         "size_bytes": stat.st_size,
         "mtime_epoch": stat.st_mtime,
         "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -524,6 +475,19 @@ def scan_jsonl_record(
 def _item_guard_status(source_scan: dict[str, Any], raw_scan: dict[str, Any], sync_item: dict[str, Any]) -> str:
     if sync_item.get("raw_missing"):
         return "raw_missing"
+    if sync_item.get("raw_source_regression"):
+        return "source_regression_raw_retained"
+    if sync_item.get("raw_metadata_only_divergence"):
+        return "source_divergence_metadata_only_raw_retained"
+    generation_status = _guardian_generation.active_guard_status(
+        source_scan, raw_scan, sync_item, validate_content=True
+    )
+    if generation_status:
+        return generation_status
+    if sync_item.get("raw_source_divergence"):
+        return "source_divergence_raw_retained"
+    if sync_item.get("raw_monotonic_probe_ok") is False:
+        return "raw_monotonic_probe_incomplete"
     if sync_item.get("raw_lag_sla_breach"):
         return "raw_lagging"
     if sync_item.get("raw_stale"):
@@ -551,40 +515,29 @@ def _item_health_warnings(source_scan: dict[str, Any], raw_scan: dict[str, Any])
 
 
 def _fast_jsonl_stat(path: str | Path, *, source_system: str) -> dict[str, Any]:
-    raw_path = Path(path).expanduser()
-    try:
-        stat = raw_path.stat()
-    except OSError:
-        return {
-            "ok": False,
-            "path": str(raw_path),
-            "path_label": _public_path_label(raw_path),
-            "exists": False,
-            "health_status": "missing_file",
-            "metadata_ok": None,
-            "has_user_and_assistant": None,
-            "fast_stat_only": True,
-        }
-    return {
-        "ok": True,
-        "path": str(raw_path),
-        "path_label": _public_path_label(raw_path),
-        "exists": True,
-        "size_bytes": stat.st_size,
-        "mtime_epoch": stat.st_mtime,
-        "mtime": datetime.fromtimestamp(stat.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "health_status": "stat_only",
-        "metadata_ok": None,
-        "has_user_and_assistant": None,
-        "bad_json_line_count": None,
-        "oversize_record_count": None,
-        "user_turn_count": None,
-        "assistant_turn_count": None,
-        "message_count": None,
-        "fast_stat_only": True,
-        "source_system": source_system,
-    }
+    return _guardian_generation.fast_jsonl_stat(
+        path,
+        source_system=source_system,
+        path_label=_public_path_label,
+    )
 
+
+def _prepare_recoverability_evidence(
+    records: list[dict[str, Any]],
+    *,
+    scan_mode: str,
+) -> dict[str, Any]:
+    return prepare_recoverability_evidence(
+        records,
+        scan_mode=scan_mode,
+        authorized_desktop_formats=set(CLAUDE_DESKTOP_RAW_FORMATS),
+        record_id_fn=_record_id,
+        records_db=records_db_path(),
+        cache=_RECOVERABILITY_CACHE,
+        candidate_limit=DEFAULT_LOST_SOURCE_RECOVERABILITY_RECORD_LIMIT,
+        per_file_byte_limit=DEFAULT_LOST_SOURCE_RECOVERABILITY_FILE_BYTES,
+        round_byte_limit=DEFAULT_LOST_SOURCE_RECOVERABILITY_ROUND_BYTES,
+    )
 
 def scan_kiro_session_json(path: str | Path) -> dict[str, Any]:
     raw_path = Path(path).expanduser()
@@ -694,28 +647,80 @@ def _connector_records(
     limit: int,
     oversize_bytes: int,
     scan_mode: str = "full",
+    artifacts: list[dict[str, Any]] | None = None,
+    population_scope: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:
+        _record_population_scope(
+            population_scope,
+            source_system,
+            source_system=source_system,
+            observed_count=0,
+            included_count=0,
+            truncated=True,
+        )
         return [{
             "source_system": source_system,
             "guard_status": "connector_unavailable",
             "error": f"{type(exc).__name__}: {exc}",
         }]
-    if not hasattr(module, "discover_sessions"):
+    if artifacts is None and not hasattr(module, "discover_sessions"):
+        _record_population_scope(
+            population_scope,
+            source_system,
+            source_system=source_system,
+            observed_count=0,
+            included_count=0,
+            truncated=True,
+        )
         return [{
             "source_system": source_system,
             "guard_status": "connector_missing_discover_sessions",
         }]
-    try:
-        artifacts = module.discover_sessions(limit=limit)
-    except Exception as exc:
-        return [{
-            "source_system": source_system,
-            "guard_status": "connector_scan_error",
-            "error": f"{type(exc).__name__}: {exc}",
-        }]
+    targeted = artifacts is not None
+    if artifacts is None:
+        try:
+            discovery_limit = max(0, int(limit)) + 1 if int(limit) > 0 else 0
+            try:
+                artifacts = module.discover_sessions(
+                    limit=discovery_limit,
+                    scan_mode=scan_mode,
+                )
+            except TypeError as exc:
+                if "scan_mode" not in str(exc):
+                    raise
+                artifacts = module.discover_sessions(limit=discovery_limit)
+        except Exception as exc:
+            _record_population_scope(
+                population_scope,
+                source_system,
+                source_system=source_system,
+                observed_count=0,
+                included_count=0,
+                truncated=True,
+            )
+            return [{
+                "source_system": source_system,
+                "guard_status": "connector_scan_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }]
+    else:
+        artifacts = [dict(item) for item in artifacts if isinstance(item, dict)]
+    observed_count = len(artifacts)
+    truncated = bool(limit > 0 and observed_count > limit)
+    if truncated:
+        artifacts = artifacts[:limit]
+    _record_population_scope(
+        population_scope,
+        source_system,
+        source_system=source_system,
+        observed_count=observed_count,
+        included_count=len(artifacts),
+        truncated=truncated,
+        targeted=targeted,
+    )
 
     records: list[dict[str, Any]] = []
     for artifact in artifacts:
@@ -723,11 +728,19 @@ def _connector_records(
         sync_item = {}
         if hasattr(module, "_raw_sync_item"):
             try:
-                sync_item = module._raw_sync_item(artifact)
+                sync_item = module._raw_sync_item(artifact, scan_mode=scan_mode)
+            except TypeError as exc:
+                if "scan_mode" in str(exc):
+                    try:
+                        sync_item = module._raw_sync_item(artifact)
+                    except Exception:
+                        sync_item = {}
+                else:
+                    sync_item = {}
             except Exception:
                 sync_item = {}
         raw_path = sync_item.get("raw_path") or ""
-        if hasattr(module, "_raw_dest_for_artifact"):
+        if not raw_path and hasattr(module, "_raw_dest_for_artifact"):
             try:
                 raw_path = str(module._raw_dest_for_artifact(artifact))
             except Exception:
@@ -749,12 +762,19 @@ def _connector_records(
                 oversize_bytes=oversize_bytes,
                 scan_mode=scan_mode,
             )
-            raw_scan = scan_jsonl_record(raw_path, source_system=source_system, oversize_bytes=oversize_bytes) if raw_path else {
+            raw_scan = _guardian_generation.scan_generation_lineage(
+                raw_path,
+                source_system=source_system,
+                oversize_bytes=oversize_bytes,
+                scan_record=scan_jsonl_record,
+                fast_stat=_fast_jsonl_stat,
+            ) if raw_path else {
                 "exists": False,
                 "health_status": "missing_file",
                 "metadata_ok": False,
                 "has_user_and_assistant": False,
             }
+        _guardian_generation.apply_sync_evidence(sync_item, source_scan, raw_path)
         if "raw_missing" not in sync_item:
             sync_item["raw_missing"] = not raw_scan.get("exists")
         if sync_item.get("raw_stale_authoritative"):
@@ -778,27 +798,57 @@ def _connector_records(
             sla_ms = int(getattr(module, "raw_lag_sla_milliseconds")())
         except Exception:
             sla_ms = 1000
-        recommend_after_ms = max(DEFAULT_BACKFILL_RECOMMEND_AFTER_MS, sla_ms * 5)
+        recommend_after_ms = int(
+            sync_item.get("backfill_recommend_after_milliseconds")
+            or max(DEFAULT_BACKFILL_RECOMMEND_AFTER_MS, sla_ms * 5)
+        )
+        monotonic_attention = bool(
+            sync_item.get("raw_source_regression")
+            or (
+                sync_item.get("raw_source_divergence")
+                and not sync_item.get("raw_metadata_only_divergence")
+            )
+            or sync_item.get("raw_monotonic_probe_ok") is False
+        )
         sync_item["raw_lag_sla_milliseconds"] = sla_ms
         sync_item["backfill_recommend_after_milliseconds"] = recommend_after_ms
         sync_item["raw_lag_sla_breach"] = bool(
             sync_item.get("raw_stale")
+            and not monotonic_attention
+            and not sync_item.get("raw_continuity_not_measured")
             and (lag_ms > sla_ms or (sla_ms == 0 and lag_bytes > 0))
         )
         sync_item["backfill_recommendation_breach"] = bool(
             sync_item.get("raw_missing")
             or (
                 sync_item.get("raw_stale")
+                and not monotonic_attention
+                and not sync_item.get("raw_continuity_not_measured")
                 and (lag_ms > recommend_after_ms or (recommend_after_ms == 0 and lag_bytes > 0))
             )
         )
         if scan_mode == "fast":
+            generation_status = _guardian_generation.active_guard_status(
+                source_scan, raw_scan, sync_item, validate_content=False
+            )
             if sync_item.get("raw_missing"):
                 guard_status = "raw_missing"
+            elif sync_item.get("raw_source_regression"):
+                guard_status = "source_regression_raw_retained"
+            elif sync_item.get("raw_metadata_only_divergence"):
+                guard_status = "source_divergence_metadata_only_raw_retained"
+            elif generation_status:
+                guard_status = generation_status
+            elif sync_item.get("raw_monotonic_probe_ok") is False:
+                guard_status = "raw_monotonic_probe_incomplete"
+            elif sync_item.get("raw_source_divergence"):
+                guard_status = "source_divergence_raw_retained"
             elif sync_item.get("raw_lag_sla_breach"):
                 guard_status = "raw_lagging"
             elif sync_item.get("raw_stale"):
                 guard_status = "raw_catching_up"
+            elif sync_item.get("raw_continuity_not_measured"):
+                guard_status = "raw_continuity_not_measured"
             elif raw_scan.get("exists") and source_scan.get("exists"):
                 guard_status = "record_stat_guarded"
             else:
@@ -827,16 +877,37 @@ def _connector_records(
             "desktop_metadata_is_conversation_body": bool(artifact.get("desktop_metadata_is_conversation_body")),
             "source_scan": source_scan,
             "raw_scan": raw_scan,
-            "raw_current": guard_status in {"record_guarded", "record_stat_guarded"},
-            "recoverable_from_raw": bool(raw_scan.get("exists") and raw_scan.get("has_user_and_assistant")),
+            "raw_current": guard_status in {
+                "record_guarded",
+                "record_stat_guarded",
+                "source_divergence_metadata_only_raw_retained",
+                "source_divergence_generation_active",
+            },
+            "recoverable_from_raw": (
+                None
+                if raw_scan.get("has_user_and_assistant") is None
+                else bool(raw_scan.get("exists") and raw_scan.get("has_user_and_assistant"))
+            ),
             "guard_status": guard_status,
             "health_warnings": health_warnings,
             "scan_mode": scan_mode,
             "sync": {
                 "raw_missing": bool(sync_item.get("raw_missing")),
                 "raw_stale": bool(sync_item.get("raw_stale")),
+                "raw_source_regression": bool(sync_item.get("raw_source_regression")),
+                "raw_source_divergence": bool(sync_item.get("raw_source_divergence")),
+                "raw_metadata_only_divergence": bool(sync_item.get("raw_metadata_only_divergence")),
+                **_guardian_generation.sync_payload(sync_item),
+                "metadata_only_fields": list(sync_item.get("metadata_only_fields") or []),
+                "metadata_divergence_probe": dict(sync_item.get("metadata_divergence_probe") or {}),
+                "raw_monotonic_status": str(sync_item.get("raw_monotonic_status") or ""),
+                "raw_monotonic_probe_ok": sync_item.get("raw_monotonic_probe_ok", True),
+                "raw_continuity_not_measured": bool(sync_item.get("raw_continuity_not_measured")),
+                "raw_continuity_evidence": str(sync_item.get("raw_continuity_evidence") or ""),
+                "raw_body_read_performed": bool(sync_item.get("raw_body_read_performed")),
                 "raw_lag_sla_breach": bool(sync_item.get("raw_lag_sla_breach")),
                 "raw_archive_lag_bytes": lag_bytes,
+                "raw_size_delta_bytes": int(sync_item.get("raw_size_delta_bytes", 0) or 0),
                 "raw_archive_lag_milliseconds": lag_ms,
                 "raw_lag_sla_milliseconds": sla_ms,
                 "backfill_recommend_after_milliseconds": recommend_after_ms,
@@ -952,7 +1023,7 @@ def _claude_desktop_authorized_raw_paths(limit: int) -> list[Path]:
         return []
     unique = list({str(path): path for path in paths}.values())
     unique.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
-    return unique[: max(1, int(limit or 20))]
+    return unique[:limit] if limit > 0 else unique
 
 
 def _claude_desktop_source_scan_from_raw(raw_path: Path, raw_scan: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
@@ -1006,9 +1077,24 @@ def _claude_desktop_authorized_raw_records(
     limit: int,
     oversize_bytes: int,
     scan_mode: str = "full",
+    population_scope: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for raw_path in _claude_desktop_authorized_raw_paths(limit):
+    discovery_limit = max(0, int(limit)) + 1 if limit > 0 else 0
+    raw_paths = _claude_desktop_authorized_raw_paths(discovery_limit)
+    observed_count = len(raw_paths)
+    truncated = bool(limit > 0 and observed_count > limit)
+    if truncated:
+        raw_paths = raw_paths[:limit]
+    _record_population_scope(
+        population_scope,
+        "claude_desktop_authorized_raw",
+        source_system="claude_desktop",
+        observed_count=observed_count,
+        included_count=len(raw_paths),
+        truncated=truncated,
+    )
+    for raw_path in raw_paths:
         refs = _jsonl_source_refs(raw_path)
         if scan_mode == "fast":
             raw_scan = _fast_jsonl_stat(raw_path, source_system="claude_desktop")
@@ -1103,7 +1189,7 @@ def _openclaw_source_artifacts(limit: int) -> list[dict[str, Any]]:
                 "agent_id": agent_dir.name,
                 "source_path": str(path),
             })
-            if len(artifacts) >= max(1, int(limit or 20)):
+            if limit > 0 and len(artifacts) >= limit:
                 return artifacts
     return artifacts
 
@@ -1129,9 +1215,29 @@ def _openclaw_legacy_raw_path_for_artifact(artifact: dict[str, Any]) -> Path:
     )
 
 
-def _openclaw_records(*, limit: int, oversize_bytes: int, scan_mode: str = "full") -> list[dict[str, Any]]:
+def _openclaw_records(
+    *,
+    limit: int,
+    oversize_bytes: int,
+    scan_mode: str = "full",
+    population_scope: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for artifact in _openclaw_source_artifacts(limit):
+    discovery_limit = max(0, int(limit)) + 1 if limit > 0 else 0
+    artifacts = _openclaw_source_artifacts(discovery_limit)
+    observed_count = len(artifacts)
+    truncated = bool(limit > 0 and observed_count > limit)
+    if truncated:
+        artifacts = artifacts[:limit]
+    _record_population_scope(
+        population_scope,
+        "openclaw",
+        source_system="openclaw",
+        observed_count=observed_count,
+        included_count=len(artifacts),
+        truncated=truncated,
+    )
+    for artifact in artifacts:
         source_path = artifact.get("source_path", "")
         raw_path = _openclaw_raw_path_for_artifact(artifact)
         legacy_raw_path = _openclaw_legacy_raw_path_for_artifact(artifact)
@@ -1200,7 +1306,7 @@ def _openclaw_records(*, limit: int, oversize_bytes: int, scan_mode: str = "full
     return records
 
 
-def _hermes_state_db_summary() -> dict[str, Any]:
+def _hermes_state_db_summary(*, session_limit: int = 200) -> dict[str, Any]:
     try:
         from hermes_paths import hermes_state_db_path
     except Exception as exc:
@@ -1271,6 +1377,7 @@ def _hermes_state_db_summary() -> dict[str, Any]:
                 stat=stat,
                 session_columns=session_columns,
                 message_columns=message_columns,
+                limit=session_limit,
             )
         finally:
             conn.close()
@@ -1522,9 +1629,24 @@ def _hermes_record_item(
     }
 
 
-def _hermes_records(*, limit: int, oversize_bytes: int, scan_mode: str = "full") -> list[dict[str, Any]]:
-    db_summary = _hermes_state_db_summary()
+def _hermes_records(
+    *,
+    limit: int,
+    oversize_bytes: int,
+    scan_mode: str = "full",
+    population_scope: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    discovery_limit = max(0, int(limit)) + 1 if limit > 0 else 2000
+    db_summary = _hermes_state_db_summary(session_limit=discovery_limit)
     if not db_summary.get("exists"):
+        _record_population_scope(
+            population_scope,
+            "hermes",
+            source_system="hermes",
+            observed_count=0,
+            included_count=0,
+            truncated=False,
+        )
         return []
     session_summaries = [
         item for item in db_summary.get("session_summaries", [])
@@ -1532,8 +1654,20 @@ def _hermes_records(*, limit: int, oversize_bytes: int, scan_mode: str = "full")
     ]
     if not session_summaries:
         session_summaries = [db_summary]
+    observed_count = max(len(session_summaries), int(db_summary.get("session_count", 0) or 0))
+    truncated = bool(limit > 0 and observed_count > limit)
+    if limit > 0:
+        session_summaries = session_summaries[:limit]
+    _record_population_scope(
+        population_scope,
+        "hermes",
+        source_system="hermes",
+        observed_count=observed_count,
+        included_count=len(session_summaries),
+        truncated=truncated,
+    )
     records: list[dict[str, Any]] = []
-    for source_scan in session_summaries[: max(1, int(limit or 20))]:
+    for source_scan in session_summaries:
         records.append(_hermes_record_item(
             source_scan,
             oversize_bytes=oversize_bytes,
@@ -1781,13 +1915,25 @@ def build_guardian_status(
     compact: bool = False,
     public: bool = True,
     source_systems: list[str] | tuple[str, ...] | set[str] | None = None,
+    connector_artifacts: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
+    detail_limit = max(0, int(limit or 0))
+    population_limit = DEFAULT_GUARDIAN_POPULATION_LIMIT_PER_SOURCE
+    population_sources: dict[str, dict[str, Any]] = {}
     source_filter = {
         str(value or "").strip()
         for value in (source_systems or [])
         if str(value or "").strip()
     }
+    targeted_artifacts = {
+        str(source_system or "").strip(): [
+            dict(item) for item in artifacts if isinstance(item, dict)
+        ]
+        for source_system, artifacts in (connector_artifacts or {}).items()
+        if str(source_system or "").strip() and isinstance(artifacts, (list, tuple))
+    }
+    targeted_refresh = connector_artifacts is not None
     backfill_result: dict[str, Any] | None = None
     if auto_backfill:
         backfill_result = run_raw_backfill(limit=limit)
@@ -1796,33 +1942,48 @@ def build_guardian_status(
     for source_system, module_name in GUARDED_CONNECTORS:
         if source_filter and source_system not in source_filter:
             continue
+        if targeted_refresh and source_system not in targeted_artifacts:
+            continue
         records.extend(_connector_records(
             source_system,
             module_name,
-            limit=limit,
+            limit=population_limit,
             oversize_bytes=oversize_bytes,
             scan_mode=scan_mode,
+            artifacts=targeted_artifacts.get(source_system) if targeted_refresh else None,
+            population_scope=population_sources,
         ))
     if not source_filter or "claude_desktop" in source_filter:
         records.extend(_claude_desktop_authorized_raw_records(
-            limit=limit,
+            limit=population_limit,
             oversize_bytes=oversize_bytes,
             scan_mode=scan_mode,
+            population_scope=population_sources,
         ))
     if not source_filter or "openclaw" in source_filter:
         records.extend(_openclaw_records(
-            limit=limit,
+            limit=population_limit,
             oversize_bytes=oversize_bytes,
             scan_mode=scan_mode,
+            population_scope=population_sources,
         ))
     if not source_filter or "hermes" in source_filter:
         records.extend(_hermes_records(
-            limit=limit,
+            limit=population_limit,
             oversize_bytes=oversize_bytes,
             scan_mode=scan_mode,
+            population_scope=population_sources,
         ))
+    recoverability_probe = _prepare_recoverability_evidence(
+        records,
+        scan_mode=scan_mode,
+    )
     attach_origin_events(records, computer_id=node_id())
-    time_origin = origin_summary(records)
+    summary_records = _annotate_logical_records(
+        records,
+        authorized_artifact_type=CLAUDE_DESKTOP_AUTHORIZED_RAW_FORMAT,
+    )
+    time_origin = origin_summary(summary_records)
 
     guarded_source_systems = set()
     observed_source_systems = set()
@@ -1832,7 +1993,12 @@ def build_guardian_status(
             "record_guarded",
             "record_stat_guarded",
             "raw_partial_conversation",
+            "source_divergence_metadata_only_raw_retained",
+            "source_divergence_generation_active",
             "authorized_raw_recoverable_source_missing",
+            "authorized_raw_one_sided_source_missing",
+            "authorized_raw_non_conversation_source_missing",
+            "source_missing_recoverable_from_raw",
         }:
             guarded_source_systems.update(_coverage_source_systems(item))
     gaps = [
@@ -1848,48 +2014,24 @@ def build_guardian_status(
         item for item in gaps
         if item.get("guard_status") != "no_live_source_sample"
     ]
-    claude_desktop_evidence = _claude_desktop_evidence_summary(records, gaps)
-    guarded = [item for item in records if item.get("guard_status") in {"record_guarded", "record_stat_guarded"}]
-    recoverable = [item for item in records if item.get("recoverable_from_raw")]
-    unhealthy = [
-        item for item in records
-        if item.get("guard_status") not in {"record_guarded", "record_stat_guarded"}
-    ]
-    corrupt = [
-        item for item in records
-        if item.get("guard_status") in {"source_corrupt", "raw_corrupt"}
-    ]
-    oversized = [
-        item for item in records
-        if any("oversized" in warning for warning in item.get("health_warnings", []))
-    ]
-    partial = [
-        item for item in records
-        if "partial" in _safe_str(item.get("guard_status"))
-        or item.get("guard_status") in {"source_metadata_incomplete"}
-    ]
-    lagging = [
-        item for item in records
-        if item.get("guard_status") in {"raw_missing", "raw_lagging"}
-    ]
-    catching_up = [
-        item for item in records
-        if item.get("guard_status") == "raw_catching_up"
-    ]
-    raw_not_current = [
-        item for item in records
-        if item.get("guard_status") in {"raw_missing", "raw_lagging", "raw_catching_up"}
-    ]
-    backfill_recommended = [
-        item for item in records if item.get("backfill_recommended")
-    ]
-    attention_records = [
-        item for item in records
-        if item.get("guard_status") in {"raw_missing", "source_corrupt", "raw_corrupt"}
-        or item.get("backfill_recommended")
-    ]
+    claude_desktop_evidence = _claude_desktop_evidence_summary(summary_records, gaps)
+    summary_ok, guardian_summary = _summarize_records(
+        summary_records,
+        physical_record_count=len(records),
+        time_origin=time_origin,
+        gap_source_count=len(actionable_gaps),
+        inactive_source_count=len(inactive_sources),
+    )
+    summary_scope = _build_summary_scope(
+        population_sources,
+        scan_mode=scan_mode,
+        source_filter=source_filter,
+        population_limit=population_limit,
+        detail_limit=detail_limit,
+        targeted_refresh=targeted_refresh,
+    )
     report: dict[str, Any] = {
-        "ok": not corrupt and not attention_records,
+        "ok": summary_ok,
         "contract": RAW_RECORD_GUARDIAN_CONTRACT,
         "generated_at": ts(),
         "read_only": not write_index and not auto_backfill,
@@ -1902,55 +2044,26 @@ def build_guardian_status(
         "raw_origin_event_contract": time_origin.get("raw_origin_event_contract"),
         "scan_mode": scan_mode,
         "fast_status_only": scan_mode == "fast",
+        "summary_scope": summary_scope,
         "records_db_path": _public_path_label(records_db_path()) if public else str(records_db_path()),
         "source_system_filter": sorted(source_filter),
         "guarded_sources": sorted(IMPLEMENTED_SOURCE_GUARDIANS | guarded_source_systems),
         "gap_sources": [item.get("source_system") for item in actionable_gaps],
         "inactive_sources": [item.get("source_system") for item in inactive_sources],
-        "summary": {
-            "record_count": len(records),
-            "record_guarded_count": len(guarded),
-            "record_stat_guarded_count": len([item for item in records if item.get("guard_status") == "record_stat_guarded"]),
-            "unhealthy_record_count": len(unhealthy),
-            "raw_not_current_count": len(raw_not_current),
-            "raw_lagging_or_missing_count": len(lagging),
-            "raw_catching_up_count": len(catching_up),
-            "raw_active_catching_up_count": len(catching_up),
-            "raw_attention_count": len(attention_records),
-            "corrupt_record_count": len(corrupt),
-            "oversized_record_count": len(oversized),
-            "partial_record_count": len(partial),
-            "recoverable_from_raw_count": len(recoverable),
-            "gap_source_count": len(actionable_gaps),
-            "inactive_source_count": len(inactive_sources),
-            "backfill_recommended_count": len(backfill_recommended),
-            "origin_event_count": time_origin.get("origin_event_count", 0),
-            "origin_witnessed_count": time_origin.get("origin_witnessed_count", 0),
-            "lost_source_count": time_origin.get("lost_source_count", 0),
-            "lost_raw_count": time_origin.get("lost_raw_count", 0),
-            "source_without_origin_count": time_origin.get("source_without_origin_count", 0),
-            "origin_without_raw_count": time_origin.get("origin_without_raw_count", 0),
-            "raw_without_origin_count": time_origin.get("raw_without_origin_count", 0),
-            "recoverable_origin_count": time_origin.get("recoverable_origin_count", 0),
-            "max_origin_lag_milliseconds": time_origin.get("max_origin_lag_milliseconds", 0),
-            "lost_labels": time_origin.get("lost_labels", {}),
-            "max_raw_lag_bytes": max((
-                int(((item.get("sync") or {}).get("raw_archive_lag_bytes", 0)) or 0)
-                for item in records
-            ), default=0),
-            "max_raw_lag_milliseconds": max((
-                int(((item.get("sync") or {}).get("raw_archive_lag_milliseconds", 0)) or 0)
-                for item in records
-            ), default=0),
-        },
+        "summary": guardian_summary,
         "time_origin": time_origin,
+        "recoverability_probe": (
+            _safe_recoverability_probe(recoverability_probe)
+            if public
+            else recoverability_probe
+        ),
         "compact": bool(compact),
         "source_evidence": {
             "claude_desktop": claude_desktop_evidence,
         },
         "claude_desktop_evidence": claude_desktop_evidence,
-        "records": _compact_records(records) if compact else records,
-        "record_details_truncated": bool(compact),
+        "records": records,
+        "record_details_truncated": False,
         "record_detail_count": len(records),
         "gaps": actionable_gaps,
         "source_gaps": actionable_gaps,
@@ -1958,7 +2071,9 @@ def build_guardian_status(
         "notes": [
             "record_guarded means source and raw both exist, raw is current, metadata is sane, and user+assistant turns are present.",
             "record_stat_guarded is a fast status-page check: source and raw files exist and sizes are current, but full JSONL body health was not scanned.",
+            "raw_continuity_not_measured means fast metadata could not prove the active source/raw pairing without a body or prefix read; it remains fail-closed until a full scan or stronger sidecar evidence is available.",
             "时间起源 means raw has been witnessed; source without a raw origin is 遗失 raw, and raw without its source anchor is 遗失源.",
+            "lost_source is triaged separately: recoverable raw is retained-platform history, unrecoverable raw is attention, and not_measured remains an evidence gap.",
             "entry_detected_body_unverified means the platform entry exists but complete conversation text is not proven.",
             "guardian_gap means a source/raw pair scanner is not implemented for that platform yet.",
             "no_live_source_sample means this machine has no local sample for an implemented connector; it is listed as inactive, not as a record guard gap.",
@@ -1974,6 +2089,18 @@ def build_guardian_status(
     if backfill_result is not None:
         report["backfill"] = backfill_result
         report["write_performed"] = True
+    detail_candidates = _compact_records(records) if compact else records
+    if detail_limit > 0:
+        detail_records = detail_candidates[:detail_limit]
+    else:
+        detail_records = detail_candidates
+    report["records"] = detail_records
+    report["record_detail_count"] = len(detail_records)
+    report["record_details_truncated"] = bool(
+        len(detail_records) < len(detail_candidates)
+        or (compact and len(detail_candidates) < len(records))
+        or compact
+    )
     if public:
         report = _sanitize_public_payload(report)
     return report
@@ -1989,6 +2116,7 @@ def status() -> dict[str, Any]:
         public=True,
     )
     summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    recoverability_probe = _safe_recoverability_probe(report.get("recoverability_probe"))
     return {
         "ok": bool(report.get("ok")),
         "source_system": "raw_record_guardian",
@@ -1996,61 +2124,36 @@ def status() -> dict[str, Any]:
         "reachable": True,
         "record_count": summary.get("record_count", 0),
         "record_guarded_count": summary.get("record_guarded_count", 0),
+        "physical_record_count": summary.get("physical_record_count", 0),
+        "logical_record_count": summary.get("logical_record_count", 0),
+        "layout_variant_count": summary.get("layout_variant_count", 0),
         "raw_not_current_count": summary.get("raw_not_current_count", 0),
         "raw_attention_count": summary.get("raw_attention_count", summary.get("raw_lagging_or_missing_count", 0)),
+        "raw_divergence_generation_active_count": summary.get("raw_divergence_generation_active_count", 0),
+        "raw_metadata_only_divergence_count": summary.get("raw_metadata_only_divergence_count", 0),
         "raw_catching_up_count": summary.get("raw_catching_up_count", 0),
         "origin_event_count": summary.get("origin_event_count", 0),
         "lost_source_count": summary.get("lost_source_count", 0),
+        "lost_source_recoverable_count": summary.get("lost_source_recoverable_count", 0),
+        "lost_source_unrecoverable_count": summary.get("lost_source_unrecoverable_count", 0),
+        "lost_source_not_measured_count": summary.get("lost_source_not_measured_count", 0),
+        "lost_source_one_sided_count": summary.get("lost_source_one_sided_count", 0),
+        "lost_source_non_conversation_count": summary.get("lost_source_non_conversation_count", 0),
         "lost_raw_count": summary.get("lost_raw_count", 0),
         "backfill_recommended_count": summary.get("backfill_recommended_count", 0),
+        "recoverability_probe": recoverability_probe,
         "guarded_sources": report.get("guarded_sources", []),
         "gap_sources": report.get("gap_sources", []),
+        "summary_scope": report.get("summary_scope", {}),
         "raw_sync": {
             "status": "raw_lagging_sla_breach" if summary.get("backfill_recommended_count") else "ok",
-            "missing_or_stale_count": summary.get("raw_attention_count", summary.get("backfill_recommended_count", 0)),
+            "missing_or_stale_count": summary.get(
+                "raw_not_current_count",
+                summary.get("raw_lagging_or_missing_count", 0),
+            ),
             "catching_up_count": summary.get("raw_catching_up_count", 0),
         },
     }
-
-
-def _compact_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return status-page friendly records without heavy scan payloads."""
-    compacted: list[dict[str, Any]] = []
-    for item in records:
-        guard_status = item.get("guard_status")
-        if guard_status in {"record_guarded", "record_stat_guarded"} and not item.get("backfill_recommended"):
-            continue
-        source_scan = item.get("source_scan") if isinstance(item.get("source_scan"), dict) else {}
-        raw_scan = item.get("raw_scan") if isinstance(item.get("raw_scan"), dict) else {}
-        compacted.append({
-            "source_system": item.get("source_system", ""),
-            "artifact_type": item.get("artifact_type", ""),
-            "session_id": item.get("session_id", ""),
-            "raw_artifact_id": item.get("raw_artifact_id", ""),
-            "canonical_window_id": item.get("canonical_window_id", ""),
-            "project_id": item.get("project_id", ""),
-            "thread_name": item.get("thread_name", ""),
-            "guard_status": guard_status,
-            "origin_id": item.get("origin_id", ""),
-            "origin_status": item.get("origin_status", ""),
-            "origin_label": item.get("origin_label", ""),
-            "origin_seen": bool(item.get("origin_seen")),
-            "raw_current": bool(item.get("raw_current")),
-            "recoverable_from_raw": bool(item.get("recoverable_from_raw")),
-            "backfill_recommended": bool(item.get("backfill_recommended")),
-            "source_path_label": item.get("source_path_label", ""),
-            "raw_path_label": item.get("raw_path_label", ""),
-            "source_exists": bool(source_scan.get("exists")),
-            "raw_exists": bool(raw_scan.get("exists")),
-            "source_health_status": source_scan.get("health_status", ""),
-            "raw_health_status": raw_scan.get("health_status", ""),
-            "source_size_bytes": int(source_scan.get("size_bytes", 0) or 0),
-            "raw_size_bytes": int(raw_scan.get("size_bytes", 0) or 0),
-            "health_warnings": item.get("health_warnings", []),
-            "sync": item.get("sync") or {},
-            "scan_mode": item.get("scan_mode", ""),
-        })
-    return compacted
 
 
 def main() -> int:

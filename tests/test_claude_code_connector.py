@@ -228,6 +228,128 @@ def test_claude_code_source_truncation_keeps_primary_raw_byte_exact(tmp_path):
     assert dest.read_bytes() == archived_bytes
 
 
+def test_claude_code_divergence_generation_continues_and_reanchors_canonical_dialogue(tmp_path):
+    projects_root, session_path, session_id = _write_claude_code_session(tmp_path)
+    env = _env(tmp_path, projects_root)
+
+    first_scan = subprocess.run(
+        [sys.executable, str(SRC / "claude_code_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    original_dest = Path(json.loads(first_scan.stdout)["items"][0]["dest"])
+    original_bytes = original_dest.read_bytes()
+    original_lines = session_path.read_bytes().splitlines(keepends=True)
+    assert len(original_lines) == 2
+
+    rewritten_assistant = json.loads(original_lines[1].decode("utf-8"))
+    rewritten_assistant["message"]["content"][0]["text"] = "分歧后的 Claude Code assistant 内容。"
+    new_user = {
+        "type": "user",
+        "sessionId": session_id,
+        "uuid": "user-2",
+        "parentUuid": "assistant-1",
+        "cwd": str(tmp_path / "workspace"),
+        "timestamp": "2026-06-05T08:00:02Z",
+        "message": {"role": "user", "content": "分歧之后继续写入的新问题。"},
+    }
+    rewritten = original_lines[0]
+    rewritten += (json.dumps(rewritten_assistant, ensure_ascii=False) + "\n").encode("utf-8")
+    rewritten += (json.dumps(new_user, ensure_ascii=False) + "\n").encode("utf-8")
+    session_path.write_bytes(rewritten)
+    expected_base = len(original_lines[0])
+
+    second_scan = subprocess.run(
+        [sys.executable, str(SRC / "claude_code_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    second_payload = json.loads(second_scan.stdout)
+    second_item = second_payload["items"][0]
+    generation_dest = Path(second_item["dest"])
+    generation_meta = json.loads(Path(str(generation_dest) + ".meta.json").read_text(encoding="utf-8"))
+    checkpoint = json.loads((tmp_path / "memcore" / ".checkpoint").read_text(encoding="utf-8"))
+    checkpoint_entry = next(value for key, value in checkpoint.items() if key.startswith("claude_code_cli:"))
+
+    assert second_payload["changed"] == 1
+    assert second_item["status"].startswith("generation_started")
+    assert generation_dest.name == original_dest.stem + ".seg1" + original_dest.suffix
+    assert original_dest.read_bytes() == original_bytes
+    assert generation_dest.read_bytes() == rewritten[expected_base:]
+    assert generation_meta["raw_generation"] == 1
+    assert generation_meta["source_base_offset"] == expected_base
+    assert generation_meta["raw_generation_predecessor"] == str(original_dest)
+    assert generation_meta["raw_order"] == 2
+    assert checkpoint_entry["generation"] == 1
+    assert checkpoint_entry["source_base_offset"] == expected_base
+    assert checkpoint_entry["archived_to"] == str(generation_dest)
+
+    generation_dialogue = [
+        json.loads(line)
+        for line in Path(str(generation_dest) + ".canonical_dialogue.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [item["role"] for item in generation_dialogue] == ["assistant", "user"]
+    assert all(
+        item["origin_source_ref"]["native_source_byte_offsets"]["start"] >= expected_base
+        for item in generation_dialogue
+    )
+
+    status = subprocess.run(
+        [sys.executable, str(SRC / "claude_code_local_connector.py"), "--status"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    raw_sync = json.loads(status.stdout)["raw_sync"]
+    assert raw_sync["missing_or_stale_count"] == 0
+    assert raw_sync["latest_missing_or_stale"] == []
+
+    new_assistant = {
+        "type": "assistant",
+        "sessionId": session_id,
+        "uuid": "assistant-2",
+        "parentUuid": "user-2",
+        "cwd": str(tmp_path / "workspace"),
+        "timestamp": "2026-06-05T08:00:03Z",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "新 generation 的 Claude Code 回复。"}],
+        },
+    }
+    appended_line = (json.dumps(new_assistant, ensure_ascii=False) + "\n").encode("utf-8")
+    with session_path.open("ab") as handle:
+        handle.write(appended_line)
+    third_scan = subprocess.run(
+        [sys.executable, str(SRC / "claude_code_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    third_item = json.loads(third_scan.stdout)["items"][0]
+    generation_dialogue_after = [
+        json.loads(line)
+        for line in Path(str(generation_dest) + ".canonical_dialogue.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert third_item["dest"] == str(generation_dest)
+    assert third_item["status"].startswith("appended_generation")
+    assert generation_dest.read_bytes() == rewritten[expected_base:] + appended_line
+    assert original_dest.read_bytes() == original_bytes
+    assert [item["role"] for item in generation_dialogue_after] == ["assistant", "user", "assistant"]
+
+
 def test_claude_code_subagents_do_not_overwrite_parent_session_raw(tmp_path):
     projects_root, parent_path, session_id = _write_claude_code_session(tmp_path)
     subagent_dir = parent_path.with_suffix("") / "subagents"

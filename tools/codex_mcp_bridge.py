@@ -474,13 +474,14 @@ def _forward_discovered(
     data: dict[str, Any],
     timeout: float,
     compact_recall: bool,
+    root: str = "",
     **kwargs: Any,
 ) -> dict[str, Any] | None:
     try:
         endpoint = resolve_client_url(
             "/mcp",
             endpoint=configured_endpoint,
-            root=os.environ.get("MEMCORE_ROOT"),
+            root=str(root or os.environ.get("MEMCORE_ROOT") or "").strip() or None,
             wait_timeout=min(max(0.0, timeout), 3.0),
         )
     except RuntimeError as exc:
@@ -494,6 +495,11 @@ def main() -> int:
         "--endpoint",
         default="",
         help="Optional explicit endpoint; omitted or legacy loopback endpoints use the front-door discovery file.",
+    )
+    parser.add_argument(
+        "--root",
+        default="",
+        help="Explicit Time Library install/runtime root for front-door discovery.",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
@@ -543,6 +549,7 @@ def main() -> int:
             data,
             args.timeout,
             args.compact_recall,
+            root=args.root,
             http_session=http_session,
             canonical_window_id=args.canonical_window_id,
             session_id=args.session_id,

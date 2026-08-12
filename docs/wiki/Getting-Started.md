@@ -2,8 +2,9 @@
 
 ## Install
 
-2026.7.18 is the current published release. Download the release zip or use
-the versioned install scripts from GitHub Releases.
+2026.8.7 is the current release candidate. The latest published release is
+2026.7.18; use the published 7.18 installer URLs below until this candidate is
+published.
 
 macOS / Linux:
 

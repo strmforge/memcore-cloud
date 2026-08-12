@@ -1833,6 +1833,7 @@ def mcp_call_tool(
                 recall_mode=str(args.get("recall_mode") or ""),
                 fts5_recall=_truthy(args.get("fts5_recall")) or _truthy(args.get("enable_fts5_recall")),
                 binding_identity=binding_identity,
+                expand_catalog_raw=_include_raw_excerpt(args),
             )
             result = compact_recall_payload(
                 result,

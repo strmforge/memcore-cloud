@@ -28,6 +28,7 @@ SKIP_START=0
 RUN_SMOKE=1
 CODEX_SKILL_STATUS="pending"
 CODEX_MCP_STATUS="pending"
+CODEX_MCP_GUARD_STATUS="pending"
 CLAUDE_CODE_MCP_STATUS="pending"
 CLAUDE_CODE_HOOK_STATUS="pending"
 CLAUDE_DESKTOP_STATUS="pending"
@@ -236,6 +237,7 @@ transaction_launchagent_labels() {
     com.memcorecloud.raw-gateway \
     com.memcorecloud.dialog-entry \
     com.memcorecloud.front-door \
+    com.memcorecloud.codex-mcp-guard \
     com.memcorecloud.menu-bar \
     ai.memcore.memcore-cloud
 }
@@ -462,6 +464,7 @@ stop_old_launchagents() {
     com.memcorecloud.raw-gateway
     com.memcorecloud.dialog-entry
     com.memcorecloud.front-door
+    com.memcorecloud.codex-mcp-guard
     com.memcorecloud.menu-bar
     ai.memcore.memcore-cloud
   )
@@ -597,6 +600,9 @@ write_config() {
   fi
   if [[ ! -f "${INSTALL_ROOT}/config/alias_map.json" && -f "${INSTALL_ROOT}/config/default_alias_map.json" ]]; then
     cp "${INSTALL_ROOT}/config/default_alias_map.json" "${INSTALL_ROOT}/config/alias_map.json"
+  fi
+  if [[ ! -f "${INSTALL_ROOT}/config/window_binding_registry.json" && -f "${INSTALL_ROOT}/config/default_window_binding_registry.json" ]]; then
+    cp "${INSTALL_ROOT}/config/default_window_binding_registry.json" "${INSTALL_ROOT}/config/window_binding_registry.json"
   fi
 
   python3 - "$INSTALL_ROOT" "$DIALOG_ENTRY_HOST" "$DIALOG_ENTRY_ENDPOINT_URL" "$FRONT_DOOR_PORT" "$INTERNAL_P3_PORT" "$INTERNAL_P4_PORT" "$INTERNAL_P6_PORT" "$INTERNAL_RAW_PORT" "$INTERNAL_DIALOG_PORT" <<'PY'
@@ -853,11 +859,14 @@ data = {
     "EnvironmentVariables": env,
     "RunAtLoad": True,
     "KeepAlive": {"SuccessfulExit": False},
-    "ProcessType": "Background",
-    "LowPriorityIO": True,
     "StandardOutPath": str(Path(log_dir) / f"{log_name}.out.log"),
     "StandardErrorPath": str(Path(log_dir) / f"{log_name}.err.log"),
 }
+if label == "com.memcorecloud.p3-recall":
+    data["ProcessType"] = "Interactive"
+else:
+    data["ProcessType"] = "Background"
+    data["LowPriorityIO"] = True
 plist_path.write_bytes(plistlib.dumps(data, sort_keys=False))
 PY
   plutil -lint "$plist" >/dev/null
@@ -977,6 +986,7 @@ install_launchagents() {
     "$py" "${INSTALL_ROOT}/src/dialog_entry_proxy.py" --host 127.0.0.1 --port "$INTERNAL_DIALOG_PORT"
   write_launch_agent com.memcorecloud.front-door front-door \
     "$py" "${INSTALL_ROOT}/src/single_port_runtime.py" --host 127.0.0.1 --preferred-port "$FRONT_DOOR_PORT"
+  install_codex_mcp_guard_launchagent
   if build_menu_bar_helper; then
     if write_menu_bar_launch_agent; then
       MENU_BAR_STATUS="installed"
@@ -999,6 +1009,7 @@ start_launchagents() {
     com.memcorecloud.raw-gateway
     com.memcorecloud.dialog-entry
     com.memcorecloud.front-door
+    com.memcorecloud.codex-mcp-guard
     com.memcorecloud.menu-bar
   )
   for label in "${labels[@]}"; do
@@ -1226,44 +1237,66 @@ install_codex_skill() {
 install_codex_mcp() {
   if [[ "$SKIP_CODEX" == "1" ]]; then
     CODEX_MCP_STATUS="skipped"
-    return
-  fi
-  local codex_exe
-  if ! codex_exe="$(find_codex_cli)"; then
-    warn "Codex CLI not found; skipping Codex MCP registration"
-    CODEX_MCP_STATUS="codex CLI not found"
+    CODEX_MCP_GUARD_STATUS="skipped"
     return
   fi
   local bridge="${INSTALL_ROOT}/tools/codex_mcp_bridge.py"
-  local policy_helper="${INSTALL_ROOT}/tools/configure_codex_mcp_policy.py"
-  local registry_path="${INSTALL_ROOT}/config/window_binding_registry.json"
+  local guard="${INSTALL_ROOT}/tools/codex_mcp_config_guard.py"
+  local config_path="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+  local guard_python="${RUNTIME_PYTHON:-${INSTALL_ROOT}/.venv/bin/python}"
+  [[ -x "$guard_python" ]] || guard_python="$(command -v python3)"
+  local codex_exe=""
+  if [[ ! -f "$config_path" ]] && ! codex_exe="$(find_codex_cli)"; then
+    warn "Codex CLI/config not found; skipping Codex MCP registration and guard"
+    CODEX_MCP_STATUS="Codex not detected"
+    CODEX_MCP_GUARD_STATUS="Codex not detected"
+    return
+  fi
   if [[ ! -f "$bridge" ]]; then
     warn "Codex MCP bridge not found: ${bridge}"
     CODEX_MCP_STATUS="bridge not found"
+    CODEX_MCP_GUARD_STATUS="bridge not found"
     return
   fi
-  "$codex_exe" mcp remove time-library >/dev/null 2>&1 || true
-  if "$codex_exe" mcp add time-library \
-    --env "PYTHONIOENCODING=utf-8" \
-    --env "PYTHONUTF8=1" \
-    --env "MEMCORE_ROOT=${INSTALL_ROOT}" \
-    --env "MEMCORE_WINDOW_BINDING_REGISTRY=${registry_path}" \
-    -- python3 "$bridge" \
-      --timeout 30 \
-      --window-binding-registry "$registry_path" \
-      --binding-key codex >/dev/null 2>&1; then
-    if [[ -f "$policy_helper" ]] && python3 "$policy_helper" \
-      --config "${CODEX_HOME:-${HOME}/.codex}/config.toml" >/dev/null 2>&1; then
-      log "Codex MCP registered with scoped recall/ack approval: time-library via ${bridge}"
-      CODEX_MCP_STATUS="time-library"
-    else
-      warn "Codex MCP registered, but scoped recall/ack approval policy could not be applied"
-      CODEX_MCP_STATUS="time-library (approval policy warning)"
-    fi
-  else
-    warn "Codex MCP registration failed; Codex users can run: codex mcp add time-library -- python3 ${bridge}"
-    CODEX_MCP_STATUS="registration failed"
+  if [[ ! -f "$guard" ]]; then
+    warn "Codex MCP config guard not found: ${guard}"
+    CODEX_MCP_STATUS="guard not found"
+    CODEX_MCP_GUARD_STATUS="guard not found"
+    return
   fi
+  if "$guard_python" "$guard" \
+    --once \
+    --config "$config_path" \
+    --install-root "$INSTALL_ROOT" \
+    --python-executable "$guard_python" \
+    --create-if-missing >/dev/null 2>&1; then
+    CODEX_MCP_GUARD_STATUS="installed"
+    log "Codex MCP registered with protected relay-preserving guard: time-library via ${bridge}"
+    CODEX_MCP_STATUS="time-library (guarded)"
+  else
+    warn "Codex MCP registration failed; existing host configuration and guard were left unchanged"
+    CODEX_MCP_STATUS="registration failed"
+    CODEX_MCP_GUARD_STATUS="registration failed"
+  fi
+}
+
+install_codex_mcp_guard_launchagent() {
+  if [[ "$CODEX_MCP_GUARD_STATUS" != "installed" ]]; then
+    # A failed or skipped registration must not remove an already working
+    # guard.  The install transaction can roll back a failed upgrade; on a
+    # successful upgrade, keeping the owned plist preserves protection while
+    # the host configuration is repaired separately.
+    log "Codex MCP config guard unchanged: ${CODEX_MCP_GUARD_STATUS}"
+    return 0
+  fi
+  local py="${RUNTIME_PYTHON:-${INSTALL_ROOT}/.venv/bin/python}"
+  local config_path="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+  local guard="${INSTALL_ROOT}/tools/codex_mcp_config_guard.py"
+  write_launch_agent com.memcorecloud.codex-mcp-guard codex-mcp-guard \
+    "$py" "$guard" --watch \
+    --config "$config_path" \
+    --install-root "$INSTALL_ROOT" \
+    --python-executable "$py"
 }
 
 install_claude_code_preflight_hook() {
@@ -1595,6 +1628,7 @@ SERVICE_LABELS=(
   com.memcorecloud.raw-gateway
   com.memcorecloud.dialog-entry
   com.memcorecloud.front-door
+  com.memcorecloud.codex-mcp-guard
   com.memcorecloud.menu-bar
   ai.memcore.memcore-cloud
 )
@@ -1624,6 +1658,7 @@ else
   log "Host integrations and LaunchAgent definitions preserved by --no-start staging mode"
   CODEX_SKILL_STATUS="skipped (--no-start)"
   CODEX_MCP_STATUS="skipped (--no-start)"
+  CODEX_MCP_GUARD_STATUS="skipped (--no-start)"
   CLAUDE_CODE_MCP_STATUS="skipped (--no-start)"
   CLAUDE_CODE_HOOK_STATUS="skipped (--no-start)"
   CLAUDE_DESKTOP_STATUS="skipped (--no-start)"
@@ -1646,6 +1681,7 @@ Hermes memory provider: $([[ "$SKIP_START" == "1" || "$SKIP_HERMES" == "1" ]] &&
 Hermes skill: $([[ "$SKIP_START" == "1" || "$SKIP_HERMES" == "1" ]] && echo skipped || echo time-library)
 Codex skill: ${CODEX_SKILL_STATUS}
 Codex MCP: ${CODEX_MCP_STATUS}
+Codex MCP config guard: ${CODEX_MCP_GUARD_STATUS}
 Claude Code MCP: ${CLAUDE_CODE_MCP_STATUS}
 Claude Code preflight hook: ${CLAUDE_CODE_HOOK_STATUS}
 Claude Desktop MCP: ${CLAUDE_DESKTOP_STATUS}

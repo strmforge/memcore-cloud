@@ -34,11 +34,27 @@ except ImportError:  # pragma: no cover
         source_system_canonical_index_kind,
         source_system_uses_raw_path_as_canonical_source,
     )
+try:
+    from raw_record_recoverability import (
+        nullable_bool as _nullable_bool,
+        nullable_int as _nullable_int,
+        preserve_measured_recoverability as _preserve_measured_recoverability,
+    )
+except ImportError:  # pragma: no cover
+    from src.raw_record_recoverability import (
+        nullable_bool as _nullable_bool,
+        nullable_int as _nullable_int,
+        preserve_measured_recoverability as _preserve_measured_recoverability,
+    )
 
 try:
     from config_loader import get_memcore_root
 except ImportError:  # pragma: no cover
     from src.config_loader import get_memcore_root
+try:
+    from src.raw_archive_monotonic import load_generation_descriptor
+except ImportError:  # pragma: no cover
+    from raw_archive_monotonic import load_generation_descriptor
 try:
     from src.raw_record_jsonl_index import (
         _chunks_for_message,
@@ -62,6 +78,10 @@ TIANDAO_CANONICAL_INDEX_CONTRACT = "tiandao_raw_record_canonical_index.v1"
 CANONICAL_MESSAGE_INDEX_SOURCE_SYSTEMS = set(declared_source_systems_with_canonical_index())
 DEFAULT_CANONICAL_INDEX_CHUNK_CHARS = 4096
 DEFAULT_CANONICAL_INDEX_MAX_JSON_LINE_BYTES = 16 * 1024 * 1024
+RAW_RETAINED_TERMINAL_GUARD_STATUSES = {
+    "source_divergence_raw_retained",
+    "source_regression_raw_retained",
+}
 
 
 def get_raw_record_canonical_index_contract() -> dict[str, Any]:
@@ -322,10 +342,13 @@ def _source_stat_change_relevant_for_canonical_refresh(
     source_system: str,
     source_exists: bool,
     raw_exists: bool,
+    guard_status: str,
 ) -> bool:
     if source_system_uses_raw_path_as_canonical_source(source_system):
         return False
     if not source_exists and raw_exists:
+        return False
+    if raw_exists and guard_status in RAW_RETAINED_TERMINAL_GUARD_STATUSES:
         return False
     return True
 
@@ -334,6 +357,7 @@ def canonical_index_refresh_due(
     *,
     db_path: str | Path | None = None,
     source_systems: list[str] | tuple[str, ...] | set[str] | None = None,
+    include_internal_targets: bool = False,
 ) -> dict[str, Any]:
     path = Path(db_path).expanduser() if db_path else records_db_path()
     source_filter = _normalized_source_system_filter(source_systems)
@@ -451,8 +475,11 @@ def canonical_index_refresh_due(
     terminal_missing_records_ignored = 0
     raw_preferred_source_drift_ignored = 0
     missing_source_with_raw_ignored = 0
+    terminal_raw_retained_source_drift_ignored = 0
+    changed_record_ids: list[str] = []
     for row in active_rows:
         source_system = _safe_str(row[1])
+        guard_status = _safe_str(row[13])
         source_exists, source_mtime, source_size = _path_state_signature(row[4] or "")
         raw_exists, raw_mtime, raw_size = _path_state_signature(row[5] or "")
         if not source_exists and not raw_exists:
@@ -466,9 +493,12 @@ def canonical_index_refresh_due(
             source_system=source_system,
             source_exists=source_exists,
             raw_exists=raw_exists,
+            guard_status=guard_status,
         )
         if source_drift and not source_changed_relevant:
-            if source_system_uses_raw_path_as_canonical_source(source_system):
+            if raw_exists and guard_status in RAW_RETAINED_TERMINAL_GUARD_STATUSES:
+                terminal_raw_retained_source_drift_ignored += 1
+            elif source_system_uses_raw_path_as_canonical_source(source_system):
                 raw_preferred_source_drift_ignored += 1
             elif not source_exists and raw_exists:
                 missing_source_with_raw_ignored += 1
@@ -480,6 +510,7 @@ def canonical_index_refresh_due(
         if not (source_changed or raw_changed):
             continue
         changed_records += 1
+        changed_record_ids.append(_safe_str(row[0]))
         if len(changed_examples) < 5:
             changed_examples.append({
                 "record_id": _safe_str(row[0]),
@@ -490,7 +521,7 @@ def canonical_index_refresh_due(
                 "raw_path": _public_path_label(row[5] or ""),
             })
 
-    return {
+    result = {
         "ok": True,
         "contract": CANONICAL_RECORD_INDEX_CONTRACT,
         "refresh_needed": changed_records > 0,
@@ -504,10 +535,14 @@ def canonical_index_refresh_due(
         "terminal_missing_records_ignored": terminal_missing_records_ignored,
         "raw_preferred_source_drift_ignored": raw_preferred_source_drift_ignored,
         "missing_source_with_raw_ignored": missing_source_with_raw_ignored,
+        "terminal_raw_retained_source_drift_ignored": terminal_raw_retained_source_drift_ignored,
         "changed_records": changed_records,
         "changed_examples": changed_examples,
         "write_performed": False,
     }
+    if include_internal_targets:
+        result["_internal_changed_record_ids"] = changed_record_ids
+    return result
 
 
 def records_db_path() -> Path:
@@ -927,6 +962,10 @@ def _canonical_index_record(
 
     raw_path = _safe_str(item.get("raw_path"))
     source_path = _safe_str(item.get("source_path"))
+    generation_descriptor = load_generation_descriptor(raw_path) if raw_path else {}
+    generation = int(generation_descriptor.get("generation", 0) or 0)
+    source_base_offset = int(generation_descriptor.get("source_base_offset", 0) or 0)
+    predecessor_raw_path = _safe_str(generation_descriptor.get("predecessor"))
     if source_system_uses_raw_path_as_canonical_source(source_system) and raw_path:
         # Some native sources are SQLite, LevelDB/log evidence, or structured
         # JSON. Once the authorized collector exports a raw JSONL transcript,
@@ -967,6 +1006,8 @@ def _canonical_index_record(
         "bad_json_line_count": 0,
         "oversized_line_count": 0,
     }
+    if previous is None and generation_descriptor and source_path != raw_path:
+        source_start_offset = source_base_offset
     if previous is not None:
         prev_source_size = int(previous[0] or 0)
         prev_raw_size = int(previous[1] or 0)
@@ -1045,13 +1086,26 @@ def _canonical_index_record(
         if raw_available:
             raw_offset_coverage_count += 1
             new_raw_offset_coverage_count += 1
+        native_id = _safe_str(source_msg.get("native_id"))
+        timestamp = _safe_str(source_msg.get("timestamp"))
+        identity_anchor = (
+            f"native:{native_id}"
+            if native_id
+            else f"timestamp:{timestamp}"
+            if timestamp
+            else "source_offset:"
+            + str(source_msg.get("offset_start", ""))
+            + ":"
+            + str(source_msg.get("message_index_in_record", ""))
+        )
         basis = "|".join([
-            record_id,
-            str(source_msg.get("line_no", "")),
-            str(source_msg.get("message_index_in_record", "")),
+            source_system,
+            session_id,
+            canonical_window_id,
+            identity_anchor,
             _safe_str(source_msg.get("role")),
-            _safe_str(source_msg.get("native_id")),
             _safe_str(source_msg.get("content_hash")),
+            str(source_msg.get("message_index_in_record", "")),
         ])
         message_id = hashlib.sha256(basis.encode("utf-8")).hexdigest()
         content = _safe_str(source_msg.get("content"))
@@ -1059,6 +1113,9 @@ def _canonical_index_record(
         message_payload = {
             "source_line": source_msg,
             "raw_line": raw_match,
+            "raw_generation": generation,
+            "source_base_offset": source_base_offset,
+            "predecessor_raw_path": predecessor_raw_path,
         }
         conn.execute(
             """
@@ -1071,7 +1128,13 @@ def _canonical_index_record(
                 line_hash, content_preview, raw_available, updated_at, payload_json
             ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             on conflict(message_id) do update set
+                record_id=excluded.record_id,
+                source_path=excluded.source_path,
+                raw_path=excluded.raw_path,
+                line_no=excluded.line_no,
                 raw_line_no=excluded.raw_line_no,
+                source_offset_start=excluded.source_offset_start,
+                source_offset_end=excluded.source_offset_end,
                 raw_offset_start=excluded.raw_offset_start,
                 raw_offset_end=excluded.raw_offset_end,
                 raw_available=excluded.raw_available,
@@ -1254,6 +1317,9 @@ def _canonical_index_record(
             "new_raw_messages_indexed": new_raw_message_count,
             "raw_offset_repairs_count": raw_offset_repairs_count,
             "raw_offset_repairs_deferred": raw_offset_repairs_deferred,
+            "raw_generation": generation,
+            "source_base_offset": source_base_offset,
+            "predecessor_raw_path": predecessor_raw_path,
         },
     }
     conn.execute(
@@ -1330,6 +1396,9 @@ def _canonical_index_record(
         "new_raw_offset_coverage_count": new_raw_offset_coverage_count,
         "raw_offset_repairs_count": raw_offset_repairs_count,
         "raw_offset_repairs_deferred": raw_offset_repairs_deferred,
+        "raw_generation": generation,
+        "source_base_offset": source_base_offset,
+        "predecessor_raw_path": predecessor_raw_path,
     }
 
 
@@ -1429,11 +1498,12 @@ def _update_records_index_once(
             if not isinstance(item, dict) or not (item.get("source_path") or item.get("raw_path")):
                 continue
             item = _normalize_record_identity(item)
+            record_id = _record_id(item)
+            previous_payload_json = existing_payloads.get(record_id, "")
+            item = _preserve_measured_recoverability(item, previous_payload_json)
             source_scan = item.get("source_scan") if isinstance(item.get("source_scan"), dict) else {}
             raw_scan = item.get("raw_scan") if isinstance(item.get("raw_scan"), dict) else {}
-            record_id = _record_id(item)
             current_payload_json = _stable_guardian_record_payload(item)
-            previous_payload_json = existing_payloads.get(record_id, "")
             if previous_payload_json:
                 previous_stable_payload = _stable_guardian_record_payload_from_json(previous_payload_json)
                 needs_deferred_repair = (
@@ -1459,14 +1529,14 @@ def _update_records_index_once(
                     raw_mtime=excluded.raw_mtime,
                     source_size_bytes=excluded.source_size_bytes,
                     raw_size_bytes=excluded.raw_size_bytes,
-                    user_turn_count=excluded.user_turn_count,
-                    assistant_turn_count=excluded.assistant_turn_count,
-                    bad_json_line_count=excluded.bad_json_line_count,
-                    oversize_record_count=excluded.oversize_record_count,
-                    metadata_ok=excluded.metadata_ok,
-                    has_user_and_assistant=excluded.has_user_and_assistant,
+                    user_turn_count=case when excluded.user_turn_count is null then records.user_turn_count else excluded.user_turn_count end,
+                    assistant_turn_count=case when excluded.assistant_turn_count is null then records.assistant_turn_count else excluded.assistant_turn_count end,
+                    bad_json_line_count=case when excluded.bad_json_line_count is null then records.bad_json_line_count else excluded.bad_json_line_count end,
+                    oversize_record_count=case when excluded.oversize_record_count is null then records.oversize_record_count else excluded.oversize_record_count end,
+                    metadata_ok=case when excluded.metadata_ok is null then records.metadata_ok else excluded.metadata_ok end,
+                    has_user_and_assistant=case when excluded.has_user_and_assistant is null then records.has_user_and_assistant else excluded.has_user_and_assistant end,
                     raw_current=excluded.raw_current,
-                    recoverable_from_raw=excluded.recoverable_from_raw,
+                    recoverable_from_raw=case when excluded.recoverable_from_raw is null then records.recoverable_from_raw else excluded.recoverable_from_raw end,
                     guard_status=excluded.guard_status,
                     updated_at=excluded.updated_at,
                     payload_json=excluded.payload_json
@@ -1484,14 +1554,14 @@ def _update_records_index_once(
                     raw_scan.get("mtime", ""),
                     int(source_scan.get("size_bytes", 0) or 0),
                     int(raw_scan.get("size_bytes", 0) or 0),
-                    int(source_scan.get("user_turn_count", 0) or 0),
-                    int(source_scan.get("assistant_turn_count", 0) or 0),
-                    int(source_scan.get("bad_json_line_count", 0) or 0),
-                    int(source_scan.get("oversize_record_count", 0) or 0),
-                    1 if source_scan.get("metadata_ok") else 0,
-                    1 if source_scan.get("has_user_and_assistant") else 0,
+                    _nullable_int(source_scan.get("user_turn_count")),
+                    _nullable_int(source_scan.get("assistant_turn_count")),
+                    _nullable_int(source_scan.get("bad_json_line_count")),
+                    _nullable_int(source_scan.get("oversize_record_count")),
+                    _nullable_bool(source_scan.get("metadata_ok")),
+                    _nullable_bool(source_scan.get("has_user_and_assistant")),
                     1 if item.get("raw_current") else 0,
-                    1 if item.get("recoverable_from_raw") else 0,
+                    _nullable_bool(item.get("recoverable_from_raw")),
                     item.get("guard_status", ""),
                     ts(),
                     current_payload_json,

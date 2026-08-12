@@ -69,6 +69,7 @@ foreach ($TaskName in @(
     "MemcoreCloudConsole",
     "MemcoreCloudGuardianLogon",
     "MemcoreCloudGuardianHealth",
+    "MemcoreCloudCodexMcpGuard",
     "MemcoreCloudTray"
 )) {
     $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -88,6 +89,7 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             $cmd -like "*$InstallDir\src\*.py*" -or
             $cmd -like "*$InstallDir\runtime\*.cmd*" -or
             $cmd -like "*$InstallDir\tools\windows_guardian.ps1*" -or
+            $cmd -like "*$InstallDir\tools\codex_mcp_config_guard.py*" -or
             $cmd -like "*$InstallDir\tools\windows_tray.ps1*"
         )
     } |

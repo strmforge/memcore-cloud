@@ -7,11 +7,17 @@ Older highlights are kept in:
 - [UPDATE_HISTORY.md](../../UPDATE_HISTORY.md)
 - [CHANGELOG.md](../../CHANGELOG.md)
 
+## Current Release Candidate
+
+See:
+
+- [RELEASE_NOTES_2026.8.7.md](../../RELEASE_NOTES_2026.8.7.md)
+
 ## Current Published Release
 
 See:
 
-- [RELEASE_NOTES_2026.7.18.md](../../RELEASE_NOTES_2026.7.18.md)
+- [Time Library 2026.7.18](https://github.com/strmforge/time-library/releases/tag/v2026.7.18)
 
 ## Local Runtime Preview
 

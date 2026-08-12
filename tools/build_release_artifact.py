@@ -63,9 +63,11 @@ EXCLUDED_RELATIVE_PATHS = {
     "tools/time_twin_star_turn_loop_trace_gate.py",
 }
 PACKAGED_TOOL_FILES = {
+    "build_fts5_recall_index.py",
     "claude_code_preflight_hook.py",
     "claude_desktop_mcp_bridge.py",
     "configure_codex_mcp_policy.py",
+    "codex_mcp_config_guard.py",
     "codex_mcp_bridge.py",
     "distill_transparency.py",
     "hermes_autonomous_loop.py",

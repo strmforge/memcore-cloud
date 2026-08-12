@@ -286,6 +286,32 @@ def test_stdio_bridges_reread_discovery_for_every_request(tmp_path, monkeypatch,
     assert endpoints == ["http://127.0.0.1:9988/mcp", "http://127.0.0.1:9989/mcp"]
 
 
+def test_codex_bridge_explicit_root_beats_stale_environment(monkeypatch):
+    bridge = _load_tool("codex_mcp_bridge.py")
+    observed_roots = []
+    monkeypatch.setenv("MEMCORE_ROOT", "/stale/installation")
+
+    def fake_resolve(path, **kwargs):
+        observed_roots.append(kwargs.get("root"))
+        return "http://127.0.0.1:9988/mcp"
+
+    monkeypatch.setattr(bridge, "resolve_client_url", fake_resolve)
+    monkeypatch.setattr(
+        bridge,
+        "_forward",
+        lambda endpoint, *_args, **_kwargs: {"jsonrpc": "2.0", "id": 1, "result": {}},
+    )
+    bridge._forward_discovered(
+        "",
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        1,
+        True,
+        root="/current/installation",
+    )
+
+    assert observed_roots == ["/current/installation"]
+
+
 def test_front_door_waits_for_restarting_internal_service_and_forwards_body_once():
     reserved = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     reserved.bind(("127.0.0.1", 0))

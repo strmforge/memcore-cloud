@@ -215,13 +215,24 @@ def _write_canonical_message(
     timestamp="2026-06-15T12:21:00Z",
     line_no=1,
     updated_at="2026-06-15T12:21:01Z",
+    raw_path_override=None,
+    raw_bytes=None,
+    raw_offset_start=0,
+    raw_offset_end=200,
 ):
     root = tmp_path / "memcore"
     records_db = root / "output" / "records" / "records.db"
     records_db.parent.mkdir(parents=True, exist_ok=True)
-    raw_path = root / "memory" / computer_name / source_system / f"{source_system}_session_jsonl" / window_id / f"{session_id}.jsonl"
+    raw_path = (
+        Path(raw_path_override)
+        if raw_path_override is not None
+        else root / "memory" / computer_name / source_system / f"{source_system}_session_jsonl" / window_id / f"{session_id}.jsonl"
+    )
     raw_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_path.write_text("", encoding="utf-8")
+    if raw_bytes is None:
+        raw_path.write_text("", encoding="utf-8")
+    else:
+        raw_path.write_bytes(raw_bytes)
     with sqlite3.connect(records_db) as conn:
         conn.execute(
             """
@@ -284,10 +295,10 @@ def _write_canonical_message(
                 timestamp,
                 line_no,
                 line_no,
-                0,
-                200,
-                0,
-                200,
+                raw_offset_start,
+                raw_offset_end,
+                raw_offset_start,
+                raw_offset_end,
                 content_preview,
                 updated_at,
             ),
@@ -7015,6 +7026,13 @@ def test_claude_desktop_window_recall_uses_catalog_index_before_raw_fallback(tmp
         "_query_raw_jsonl_fallback",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("catalog hit must not scan raw JSONL")),
     )
+    monkeypatch.setattr(
+        raw_gateway,
+        "_extract_bounded_raw_excerpt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("compact catalog recall must not expand raw excerpts")
+        ),
+    )
 
     called = raw_gateway.handle_mcp_request({
         "jsonrpc": "2.0",
@@ -7070,6 +7088,146 @@ def test_claude_desktop_window_recall_uses_catalog_index_before_raw_fallback(tmp
     assert content["consumer_receipt"]["raw_recall_trajectory_contract"] == "raw_recall_trajectory.v2026.6.17"
     assert content["consumer_receipt"]["raw_recall_trajectory"][1]["step"] == "catalog_index_projection"
     assert "raw_excerpt" not in content["items"][0]
+
+
+def test_mcp_raw_recall_reads_each_canonical_generation_from_its_own_raw_segment(tmp_path, monkeypatch):
+    root = tmp_path / "memcore"
+    session_id = "generation-session"
+    window_id = "generation-window"
+    raw_dir = root / "memory" / "LOCALNODE" / "codex" / "codex_session_jsonl" / window_id
+    first_raw = raw_dir / f"{session_id}.jsonl"
+    second_raw = raw_dir / f"{session_id}.seg1.jsonl"
+    first_lookup = "GENERATION_ZERO_LOOKUP"
+    second_lookup = "GENERATION_ONE_LOOKUP"
+    first_marker = "SEGMENT_ZERO_VERBATIM_SOURCE"
+    second_marker = "SEGMENT_ONE_VERBATIM_SOURCE"
+    first_line = (
+        json.dumps(
+            {
+                "id": "native-generation-zero",
+                "timestamp": "2026-07-31T10:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": first_marker}],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    second_line = (
+        json.dumps(
+            {
+                "id": "native-generation-one",
+                "timestamp": "2026-07-31T10:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": second_marker}],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    records_db, _ = _write_canonical_message(
+        tmp_path,
+        source_system="codex",
+        computer_name="LOCALNODE",
+        session_id=session_id,
+        window_id=window_id,
+        message_id="message-generation-zero",
+        record_id="record-generation-lineage",
+        native_id="native-generation-zero",
+        role="user",
+        timestamp="2026-07-31T10:00:00Z",
+        line_no=1,
+        content_preview=f"{first_lookup} catalog navigation only",
+        raw_path_override=first_raw,
+        raw_bytes=first_line,
+        raw_offset_start=0,
+        raw_offset_end=len(first_line),
+    )
+    _write_canonical_message(
+        tmp_path,
+        source_system="codex",
+        computer_name="LOCALNODE",
+        session_id=session_id,
+        window_id=window_id,
+        message_id="message-generation-one",
+        record_id="record-generation-lineage",
+        native_id="native-generation-one",
+        role="assistant",
+        timestamp="2026-07-31T10:01:00Z",
+        line_no=2,
+        content_preview=f"{second_lookup} catalog navigation only",
+        raw_path_override=second_raw,
+        raw_bytes=second_line,
+        raw_offset_start=0,
+        raw_offset_end=len(second_line),
+    )
+    monkeypatch.setenv("MEMCORE_RECORDS_DB", str(records_db))
+    _, raw_gateway = _reload_modules(tmp_path)
+
+    def recall(query):
+        response = raw_gateway.handle_mcp_request({
+            "jsonrpc": "2.0",
+            "id": query,
+            "method": "tools/call",
+            "params": {
+                "name": "time_library_recall",
+                "arguments": {
+                    "query": query,
+                    "consumer": "codex",
+                    "source_system": "codex",
+                    "memory_scope": "window",
+                    "canonical_window_id": window_id,
+                    "session_id": session_id,
+                    "limit": 1,
+                    "excerpt_chars": 300,
+                    "response_budget": "raw",
+                    "delivery_tracking": False,
+                },
+            },
+        })
+        content = response["result"]["structuredContent"]
+        assert content["catalog_index_used"] is True
+        assert content["response_budget"]["mode"] == "raw"
+        assert content["raw_fallback_used"] is False
+        assert len(content["items"]) == 1
+        item = content["items"][0]
+        assert content["consumer_receipt"]["used_source_refs"][0]["source_path"] == item["source_path"]
+        assert content["library_index_projection_refs"][0]["source_path"] == item["source_path"]
+        assert content["library_index_projection_refs"][0]["raw_evidence_status"] == "raw_offset"
+        return item
+
+    first_item = recall(first_lookup)
+    second_item = recall(second_lookup)
+
+    assert first_item["source_path"] == str(first_raw)
+    assert second_item["source_path"] == str(second_raw)
+    assert first_marker in first_item["raw_excerpt"]
+    assert second_marker not in first_item["raw_excerpt"]
+    assert second_marker in second_item["raw_excerpt"]
+    assert first_marker not in second_item["raw_excerpt"]
+    assert first_lookup not in first_item["raw_excerpt"]
+    assert second_lookup not in second_item["raw_excerpt"]
+
+    for item, expected in ((first_item, first_line), (second_item, second_line)):
+        offsets = item["byte_offsets"]
+        source_bytes = Path(item["source_path"]).read_bytes()
+        assert source_bytes[offsets["start"]:offsets["end"]] == expected
+        assert item["raw_evidence_status"] == "raw_offset"
+        assert item["raw_expand_status"] == "raw_offset"
+        assert item["raw_expand_from_catalog_index"] is True
+        assert item["evidence_hash"] == hashlib.sha256(item["raw_excerpt"].encode("utf-8")).hexdigest()
+        assert item["library_card"]["verbatim_excerpt"] == item["raw_excerpt"]
+        assert item["library_card"]["verbatim_sha256"] == item["evidence_hash"]
+        assert item["library_card"]["byte_offsets"] == offsets
 
 
 def test_raw_gateway_window_recall_catalog_miss_uses_bounded_raw_fallback_stats(tmp_path, monkeypatch):

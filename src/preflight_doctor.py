@@ -576,7 +576,7 @@ def _score_connection(productized: dict[str, Any], preflight: dict[str, Any] | N
         signals.append("record_chain_healthy")
     elif record and live_entry_validated:
         score += 18
-        signals.append("live_work_preflight_connection_validated")
+        signals.append("work_preflight_live_connection_validated")
         attention.append(f"record_doctor_status={record.get('doctor_status', '')}")
         attention.append("record_chain_attention_is_non_blocking_for_live_connection_score")
     elif record:

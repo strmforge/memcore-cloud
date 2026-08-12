@@ -29,6 +29,30 @@
 - Added storage-pattern and regression coverage for those fast-moving open-source agents while keeping discovery metadata-only: no chat bodies are read and no tool is promoted to complete conversation memory until a verified collector proves the native format.
 - Added a model-source chain for unfamiliar tool recognition: user-filled or env model settings first, Memcore's own optional recognition model next, shared model identity if present, OpenClaw/Hermes inherited routes after that, and local rules when no model is available.
 
+## [2026.8.7] - 2026-08-07
+
+- Strengthened source-preserving raw archive and canonical record checks so
+  source regression, missing source, recoverability, and not-measured states
+  remain distinct instead of being collapsed into a green aggregate.
+- Added bounded, public-safe Guardian recoverability diagnostics that keep raw
+  content, payloads, paths, secrets, and credentials out of the status surface.
+- Improved platform-neutral local connector and Windows Guardian task
+  orchestration with explicit, fail-closed runtime checks for unattended paths.
+
+## [2026.7.25] - 2026-07-25
+
+- Added a platform-neutral Codex MCP configuration guard for hosts whose local
+  configuration manager periodically replaces `config.toml`. Installers now
+  reconcile only the Time Library MCP and approval tables, preserve provider/
+  relay and unrelated MCP settings, fail closed on malformed or conflicting
+  configuration, and keep a user-level watcher for later replacements. Failed
+  or skipped registration preserves an existing owned guard. This is a host
+  configuration lifecycle fix; it does not change raw, recall, event ordering,
+  delivery, or authentication semantics.
+- Hardened the guard's TOML section boundaries for array tables and multiline
+  strings, preventing unrelated relay configuration from being swallowed during
+  recovery.
+
 ## [2026.7.18] - 2026-07-18
 
 - Unified the local console, API, MCP, and raw entry routes behind one discoverable front door that can move when the preferred port is occupied.

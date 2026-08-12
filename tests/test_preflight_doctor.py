@@ -651,7 +651,7 @@ def test_preflight_doctor_live_work_preflight_makes_record_attention_non_blockin
 
     connection = payload["score_breakdown"]["connection_health_score"]
     assert payload["connection_health_score"] == 100
-    assert "live_work_preflight_connection_validated" in connection["signals"]
+    assert "work_preflight_live_connection_validated" in connection["signals"]
     assert "record_chain_attention_is_non_blocking_for_live_connection_score" in connection["attention"]
     assert "record_doctor_status=attention" in connection["attention"]
 

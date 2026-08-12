@@ -1175,7 +1175,6 @@ def _active_project_index_item(
     return item
 
 
-
 def _active_layer_for_item(
     item: Dict[str, Any],
     *,
@@ -1915,7 +1914,6 @@ def _consumer_receipt(
     )
 
 
-
 def _truthy(value: Any) -> bool:
     return _routing_truthy(value)
 
@@ -2224,7 +2222,6 @@ def _query_payload_from_items(
     )
 
 
-
 def query_raw_source_refs(
     query: str,
     source_system: str = '',
@@ -2247,6 +2244,7 @@ def query_raw_source_refs(
     recall_mode: str = '',
     fts5_recall: bool = False,
     binding_identity: Optional[str] = None,
+    expand_catalog_raw: bool = False,
 ) -> Dict[str, Any]:
     return _raw_recall_query.query_raw_source_refs_impl(
         globals(),
@@ -2271,8 +2269,8 @@ def query_raw_source_refs(
         recall_mode=recall_mode,
         fts5_recall=fts5_recall,
         binding_identity=binding_identity,
+        expand_catalog_raw=expand_catalog_raw,
     )
-
 
 
 def health_payload() -> Dict[str, Any]:
@@ -2533,6 +2531,7 @@ class Handler(BaseHTTPRequestHandler):
             task_id,
             recall_mode=recall_mode,
             fts5_recall=_truthy(fts5_recall),
+            expand_catalog_raw=_include_raw_excerpt(recall_args),
         )
         self.send_json(compact_recall_payload(
             result,
@@ -2676,6 +2675,7 @@ class Handler(BaseHTTPRequestHandler):
             task_id,
             recall_mode=recall_mode,
             fts5_recall=fts5_recall,
+            expand_catalog_raw=_include_raw_excerpt(data),
         )
         self.send_json(compact_recall_payload(
             result,

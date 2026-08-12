@@ -371,6 +371,9 @@ def test_raw_record_guardian_delegates_canonical_index_under_tiandao():
     assert backfill_contract["memory_write_performed"] is False
     assert backfill_contract["platform_write_performed"] is False
     assert backfill_contract["authorization_required_for_write"] is True
+    assert backfill_contract["divergence_generation_policy"] == (
+        "connector_owned_ingest_only; direct_openclaw_backfill_retains_divergent_raw"
+    )
 
     guardian_path = SRC / "raw_record_guardian.py"
     canonical_index_path = SRC / "raw_record_canonical_index.py"

@@ -167,7 +167,7 @@ PUBLIC_SURFACE_PATHS = (
     "README.md",
     "README.en.md",
     "README.zh-CN.md",
-    "RELEASE_NOTES_2026.7.18.md",
+    "RELEASE_NOTES_2026.8.7.md",
     "UPDATE_HISTORY.md",
     "CHANGELOG.md",
     "docs",
@@ -191,7 +191,7 @@ REPOSITORY_WORDING_PATHS = (
     "INTRODUCTION.md",
     "CHANGELOG.md",
     "UPDATE_HISTORY.md",
-    "RELEASE_NOTES_2026.7.18.md",
+    "RELEASE_NOTES_2026.8.7.md",
     "config",
     "docs",
     "install.sh",
@@ -240,6 +240,7 @@ PERSONAL_IDENTITY_TERMS = (
     _term("/", "Users", "/", "yang", "haibin"),
     _term("yang", "haibinde"),
 )
+LOB_CREDENTIAL_SHAPE = re.compile(r"\b(?:live|test)_[a-zA-Z0-9_]{35}\b")
 PUBLIC_SURFACE_SCAN_TERMS = (
     *FAKE_PRESET_TERMS,
     _term("/", "Volumes", "/"),
@@ -408,7 +409,7 @@ def assert_no_public_surface_terms(source: Path) -> None:
         source / "INTRODUCTION.md",
         source / "CHANGELOG.md",
         source / "UPDATE_HISTORY.md",
-        source / "RELEASE_NOTES_2026.7.18.md",
+        source / "RELEASE_NOTES_2026.8.7.md",
         source / "config",
         source / "docs",
         source / "install.sh",
@@ -671,7 +672,7 @@ def assert_no_personal_identity_terms(source: Path) -> None:
         source / "INTRODUCTION.md",
         source / "CHANGELOG.md",
         source / "UPDATE_HISTORY.md",
-        source / "RELEASE_NOTES_2026.7.18.md",
+        source / "RELEASE_NOTES_2026.8.7.md",
         source / "config",
         source / "docs",
         source / "install.sh",
@@ -699,6 +700,26 @@ def assert_no_personal_identity_terms(source: Path) -> None:
                 findings.append(f"{path.relative_to(source)}: personal identity term")
     if findings:
         raise SystemExit("personal identity terms are not allowed in public release source:\n" + "\n".join(findings[:80]))
+
+
+def assert_no_lob_credential_shapes(source: Path) -> None:
+    findings: list[str] = []
+    scan_roots = [source / rel for rel in REPOSITORY_WORDING_PATHS if rel != "tests"]
+    for path in iter_text_files(scan_roots):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError as exc:
+            raise SystemExit(f"failed to scan provider credential shapes in {path}: {exc}") from exc
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if LOB_CREDENTIAL_SHAPE.search(line):
+                findings.append(f"{path.relative_to(source)}:{line_no}: Lob credential-shaped value")
+    if findings:
+        raise SystemExit(
+            "provider credential-shaped values are not allowed in public release source:\n"
+            + "\n".join(findings[:80])
+        )
 
 
 def assert_neutral_license_identity(source: Path) -> None:
@@ -756,6 +777,7 @@ def main() -> int:
         run_repository_wording_scan(source)
         assert_no_private_denylist_terms_in_repository(source)
         assert_no_personal_identity_terms(source)
+        assert_no_lob_credential_shapes(source)
         assert_neutral_license_identity(source)
         run_shell_checks(source)
         run_git_checks(source)

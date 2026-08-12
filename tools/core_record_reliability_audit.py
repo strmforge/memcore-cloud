@@ -23,6 +23,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from raw_record_recoverability import lost_source_triage as _lost_source_triage
+
 CONTRACT = "memcore_core_record_reliability_audit.v1"
 AUDIENCE = "maintainer_only_not_product_ui"
 DEFAULT_FOCUS_SOURCES = (
@@ -45,6 +47,12 @@ ATTENTION_STATUSES = {
     "connector_scan_error",
     "connector_missing_discover_sessions",
     "authorized_raw_source_unverified",
+    "source_regression_raw_retained",
+    "source_divergence_raw_retained",
+    "source_divergence_generation_active",
+    "raw_monotonic_probe_incomplete",
+    "source_missing_unrecoverable_from_raw",
+    "authorized_raw_unrecoverable_source_missing",
 }
 
 PARTIAL_STATUSES = {
@@ -55,7 +63,16 @@ PARTIAL_STATUSES = {
 PASS_STATUSES = {
     "record_guarded",
     "record_stat_guarded",
+    "source_divergence_metadata_only_raw_retained",
     "authorized_raw_recoverable_source_missing",
+    "authorized_raw_one_sided_source_missing",
+    "authorized_raw_non_conversation_source_missing",
+    "source_missing_recoverable_from_raw",
+}
+
+OBSERVE_STATUSES = {
+    "source_missing_recoverability_unmeasured",
+    "authorized_raw_source_recoverability_unmeasured",
 }
 
 raw_record_guardian = None
@@ -205,6 +222,10 @@ def _record_is_partial(item: dict[str, Any]) -> bool:
     return str(item.get("guard_status") or "") in PARTIAL_STATUSES
 
 
+def _record_is_observe(item: dict[str, Any]) -> bool:
+    return str(item.get("guard_status") or "") in OBSERVE_STATUSES
+
+
 def _record_is_pass(item: dict[str, Any]) -> bool:
     status = str(item.get("guard_status") or "")
     return status in PASS_STATUSES and not item.get("backfill_recommended")
@@ -235,6 +256,7 @@ def _status_for_source(
         item for item in source_records
         if _record_is_partial(item) and not item.get("backfill_recommended")
     ]
+    evidence_incomplete = [item for item in source_records if _record_is_observe(item)]
     guarded = [item for item in source_records if _record_is_pass(item)]
 
     if attention:
@@ -247,6 +269,8 @@ def _status_for_source(
         state = "guarded_with_source_partial_samples"
     elif partial:
         state = "source_partial_samples"
+    elif evidence_incomplete:
+        state = "source_recoverability_not_measured"
     elif guarded:
         state = "guarded"
     elif source in inactive_sources:
@@ -261,6 +285,7 @@ def _status_for_source(
         "guarded_record_count": len(guarded),
         "catching_up_count": len(catching_up),
         "partial_sample_count": len(partial),
+        "recoverability_not_measured_count": len(evidence_incomplete),
         "attention_record_count": len(attention),
         "guard_status_counts": status_counts,
     }
@@ -281,7 +306,8 @@ def _issue_samples(records: list[dict[str, Any]], *, limit: int) -> list[dict[st
             "thread_name": item.get("thread_name", ""),
             "guard_status": item.get("guard_status", ""),
             "backfill_recommended": bool(item.get("backfill_recommended")),
-            "recoverable_from_raw": bool(item.get("recoverable_from_raw")),
+            "recoverable_from_raw": item.get("recoverable_from_raw"),
+            "recoverability_status": item.get("recoverability_status", "not_measured"),
             "source_exists": bool(source_scan.get("exists")),
             "raw_exists": bool(raw_scan.get("exists")),
             "source_health_status": source_scan.get("health_status", ""),
@@ -304,8 +330,11 @@ def _action_items(
         items.append("Run explicit raw backfill for sources marked backfill_recommended.")
     if _int(summary.get("lost_raw_count")):
         items.append("Inspect 遗失 raw entries first; they mean a source exists without witnessed raw.")
-    if _int(summary.get("lost_source_count")):
-        items.append("Inspect 遗失源 entries and preserve recoverable raw before source repair.")
+    _lost_source, _recoverable_source, unrecoverable_source, unmeasured_source = _lost_source_triage(summary)
+    if unrecoverable_source:
+        items.append("Inspect measured-unrecoverable 遗失源 entries before source repair.")
+    if unmeasured_source:
+        items.append("Complete the bounded 遗失源 structural check; not_measured is not data loss.")
     if issue_sources:
         items.append("Review attention sources: " + ", ".join(sorted(set(issue_sources))))
     if status == "needs_samples":
@@ -350,24 +379,26 @@ def classify_report(
     record_count = _int(summary.get("record_count"))
     raw_attention_count = _int(summary.get("raw_attention_count"))
     backfill_count = _int(summary.get("backfill_recommended_count"))
-    lost_source_count = _int(summary.get("lost_source_count"))
+    lost_source_count, recoverable_source_count, unrecoverable_source_count, unmeasured_source_count = _lost_source_triage(summary)
     lost_raw_count = _int(summary.get("lost_raw_count"))
     corrupt_count = _int(summary.get("corrupt_record_count"))
     gap_count = _int(summary.get("gap_source_count"))
     catching_up_count = _int(summary.get("raw_catching_up_count"))
     raw_not_current_count = _int(summary.get("raw_not_current_count"))
     partial_count = _int(summary.get("partial_record_count"))
+    summary_scope = guardian_report.get("summary_scope") if isinstance(guardian_report.get("summary_scope"), dict) else {}
+    summary_is_sample = bool(summary_scope.get("summary_is_sample"))
 
     if backfill_count:
         audit_status = "needs_backfill"
-    elif raw_attention_count or lost_source_count or lost_raw_count or corrupt_count or gap_count or issue_sources:
+    elif raw_attention_count or unrecoverable_source_count or lost_raw_count or corrupt_count or gap_count or issue_sources:
         audit_status = "attention"
     elif record_count == 0 or all(
         item["state"] in {"inactive_no_live_source_sample", "needs_sample"}
         for item in focus_statuses
     ):
         audit_status = "needs_samples"
-    elif catching_up_count or raw_not_current_count or partial_count:
+    elif catching_up_count or raw_not_current_count or partial_count or unmeasured_source_count or summary_is_sample:
         audit_status = "observe"
     else:
         audit_status = "pass"
@@ -386,6 +417,7 @@ def classify_report(
         "source_guardian_contract": guardian_report.get("contract", ""),
         "index_contract": guardian_report.get("index_contract", ""),
         "time_origin_contract": guardian_report.get("time_origin_contract", ""),
+        "summary_scope": summary_scope,
         "audit_status": audit_status,
         "attention_required": attention_required,
         "record_chain_proven": audit_status in {"pass", "observe"},
@@ -393,12 +425,24 @@ def classify_report(
         "source_statuses": focus_statuses,
         "summary": {
             "record_count": record_count,
+            "physical_record_count": _int(summary.get("physical_record_count")),
+            "logical_record_count": _int(summary.get("logical_record_count")),
+            "layout_variant_count": _int(summary.get("layout_variant_count")),
             "record_guarded_count": _int(summary.get("record_guarded_count")),
             "raw_not_current_count": raw_not_current_count,
             "raw_catching_up_count": catching_up_count,
             "raw_attention_count": raw_attention_count,
+            "raw_divergence_generation_active_count": _int(
+                summary.get("raw_divergence_generation_active_count")
+            ),
+            "raw_metadata_only_divergence_count": _int(summary.get("raw_metadata_only_divergence_count")),
             "backfill_recommended_count": backfill_count,
             "lost_source_count": lost_source_count,
+            "lost_source_recoverable_count": recoverable_source_count,
+            "lost_source_unrecoverable_count": unrecoverable_source_count,
+            "lost_source_not_measured_count": unmeasured_source_count,
+            "lost_source_one_sided_count": _int(summary.get("lost_source_one_sided_count")),
+            "lost_source_non_conversation_count": _int(summary.get("lost_source_non_conversation_count")),
             "lost_raw_count": lost_raw_count,
             "inactive_source_count": _int(summary.get("inactive_source_count")),
             "gap_source_count": gap_count,
@@ -419,7 +463,7 @@ def classify_report(
             "This is a maintainer-only audit and must not be surfaced as an ordinary user completion panel.",
             "no_live_source_sample is inactive evidence, not a record failure.",
             "Short raw_catching_up is observed, not failed, unless backfill_recommended is true.",
-            "遗失源 / 遗失 raw are record-chain incidents and take priority over feature expansion.",
+            "Only measured-unrecoverable 遗失源 and 遗失 raw are incidents; recoverable is retained platform history and not_measured is an evidence gap.",
         ],
     }
 
@@ -454,6 +498,9 @@ def build_audit(
                 "raw_attention_count": 0,
                 "backfill_recommended_count": 0,
                 "lost_source_count": 0,
+                "lost_source_recoverable_count": 0,
+                "lost_source_unrecoverable_count": 0,
+                "lost_source_not_measured_count": 0,
                 "lost_raw_count": 0,
             },
             "notes": [

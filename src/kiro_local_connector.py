@@ -26,9 +26,17 @@ try:
 except ImportError:
     from raw_archive_layout import existing_or_preferred_raw_archive_path, preferred_raw_archive_path
 try:
-    from src.raw_archive_monotonic import latest_archive_segment, select_archive_segment
+    from src.raw_archive_monotonic import (
+        latest_archive_segment,
+        select_archive_segment,
+        select_archive_segment_metadata_only,
+    )
 except ImportError:
-    from raw_archive_monotonic import latest_archive_segment, select_archive_segment
+    from raw_archive_monotonic import (
+        latest_archive_segment,
+        select_archive_segment,
+        select_archive_segment_metadata_only,
+    )
 try:
     from src.window_binding_registry import register_current_window
 except ImportError:
@@ -490,15 +498,29 @@ def _load_raw_meta(dest: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _raw_sync_item(artifact: dict[str, Any]) -> dict[str, Any]:
+def _raw_sync_item(artifact: dict[str, Any], scan_mode: str = "full") -> dict[str, Any]:
+    scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
     src = Path(artifact.get("source_path", "")).expanduser()
     src_stat = _safe_stat(src)
     base_dest = _raw_dest_for_artifact(artifact)
-    dest = (
-        select_archive_segment(base_dest, src_stat.st_ino)
-        if src_stat is not None
-        else latest_archive_segment(base_dest)
-    )
+    if scan_mode == "fast":
+        selection = select_archive_segment_metadata_only(
+            base_dest,
+            src_stat.st_ino if src_stat is not None else None,
+        )
+        dest = Path(selection["archive_path"])
+    else:
+        selection = {
+            "selection_status": "full_connector_selection",
+            "selection_proven_by_metadata": True,
+            "generation_descriptor_incomplete": False,
+            "body_read_performed": True,
+        }
+        dest = (
+            select_archive_segment(base_dest, src_stat.st_ino, src)
+            if src_stat is not None
+            else latest_archive_segment(base_dest)
+        )
     dest_stat = _safe_stat(dest)
     observed_at_ms = int(time.time() * 1000)
     source_size = int(src_stat.st_size if src_stat else artifact.get("size_bytes", 0) or 0)
@@ -506,10 +528,29 @@ def _raw_sync_item(artifact: dict[str, Any]) -> dict[str, Any]:
     raw_size = int(dest_stat.st_size if dest_stat else 0)
     raw_mtime_ms = _stat_mtime_ms(dest_stat)
     meta = _load_raw_meta(dest) if dest.exists() else {}
-    source_checksum = _file_hash(src) if src_stat else ""
+    source_checksum = _file_hash(src) if src_stat and scan_mode == "full" else ""
     meta_checksum = str(meta.get("source_checksum") or "")
     meta_source_size = int(meta.get("source_size", 0) or 0)
     missing = not dest.exists()
+    try:
+        metadata_mtime = float(meta.get("source_mtime", -1.0))
+    except (TypeError, ValueError):
+        metadata_mtime = -1.0
+    metadata_identity_proven = bool(
+        scan_mode == "full"
+        or (
+            src_stat is not None
+            and selection.get("source_inode_match")
+            and metadata_mtime == float(src_stat.st_mtime)
+        )
+    )
+    metadata_available = bool(meta_checksum and meta_source_size)
+    continuity_not_measured = bool(
+        scan_mode == "fast"
+        and not missing
+        and not selection.get("generation_descriptor_incomplete")
+        and (not metadata_identity_proven or not metadata_available)
+    )
     stale = bool(
         not missing
         and (
@@ -518,6 +559,7 @@ def _raw_sync_item(artifact: dict[str, Any]) -> dict[str, Any]:
             or (source_size and not meta_source_size)
         )
     )
+    source_regression = bool(source_size and meta_source_size and source_size < meta_source_size)
     raw_mtime_gap_ms = max(0, source_mtime_ms - raw_mtime_ms) if stale and source_mtime_ms and raw_mtime_ms else 0
     lag_ms = max(0, observed_at_ms - source_mtime_ms) if stale and source_mtime_ms else 0
     lag_bytes = max(0, source_size - meta_source_size) if stale else (source_size if missing else 0)
@@ -536,6 +578,26 @@ def _raw_sync_item(artifact: dict[str, Any]) -> dict[str, Any]:
         "raw_missing": missing,
         "raw_stale": stale,
         "raw_stale_authoritative": True,
+        "raw_source_regression": source_regression,
+        "raw_generation_descriptor_incomplete": bool(selection.get("generation_descriptor_incomplete")),
+        "raw_monotonic_probe_ok": (
+            None
+            if continuity_not_measured
+            else not selection.get("generation_descriptor_incomplete")
+        ),
+        "raw_monotonic_status": (
+            "raw_generation_descriptor_incomplete"
+            if selection.get("generation_descriptor_incomplete")
+            else "source_regression_raw_retained"
+            if source_regression
+            else "raw_continuity_not_measured_fast"
+            if continuity_not_measured
+            else ""
+        ),
+        "raw_continuity_not_measured": continuity_not_measured,
+        "raw_continuity_evidence": str(selection.get("selection_status") or ""),
+        "raw_sync_scan_mode": scan_mode,
+        "raw_body_read_performed": bool(selection.get("body_read_performed")),
         "raw_archive_lag_bytes": lag_bytes,
         "raw_archive_lag_milliseconds": lag_ms,
         "raw_source_mtime_gap_milliseconds": raw_mtime_gap_ms,
@@ -546,7 +608,11 @@ def _raw_sync_item(artifact: dict[str, Any]) -> dict[str, Any]:
         "raw_meta_source_size_bytes": meta_source_size,
         "source_path_label": _public_path_label(str(src)),
         "raw_path_label": _public_path_label(str(dest)),
-        "raw_freshness_basis": "source_json_checksum_meta",
+        "raw_freshness_basis": (
+            "source_json_checksum_meta"
+            if scan_mode == "full"
+            else "source_and_raw_stat_plus_existing_sidecars"
+        ),
     }
 
 
@@ -588,7 +654,7 @@ def archive_session(source_path: str, dry_run: bool = False, artifact: dict[str,
                 "raw_shrink_performed": False,
             }
         return str(base_dest), "error: cannot stat source", {"records_written": 0}
-    dest = select_archive_segment(base_dest, stat.st_ino)
+    dest = select_archive_segment(base_dest, stat.st_ino, src)
     fingerprint = _file_hash(src)
     checkpoint = load_checkpoint()
     key = _checkpoint_key(str(src))

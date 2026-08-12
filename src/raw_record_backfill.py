@@ -44,6 +44,8 @@ HERMES_STATE_DB_RAW_FORMAT = "hermes_state_db_messages_jsonl"
 OPENCLAW_NATIVE_RAW_FORMAT = "openclaw_session_jsonl"
 HERMES_SOURCE_SYSTEM = source_system_for_raw_backfill_kind("state_db_messages") or "hermes"
 OPENCLAW_SOURCE_SYSTEM = source_system_for_raw_backfill_kind("source_artifact_copy") or "openclaw"
+# Direct repair retains divergent raw; connector-owned ingestion must opt into generations.
+DIRECT_OPENCLAW_BACKFILL_CONTINUE_ON_DIVERGENCE = False
 
 
 def _guardian_module():
@@ -91,6 +93,7 @@ def get_raw_record_backfill_contract() -> dict[str, Any]:
         "memory_write_performed": False,
         "platform_write_performed": False,
         "authorization_required_for_write": True,
+        "divergence_generation_policy": "connector_owned_ingest_only; direct_openclaw_backfill_retains_divergent_raw",
         "authorized_write_scopes": [
             "raw_archive_backfill",
             "raw_archive_meta_sidecar",
@@ -164,7 +167,7 @@ def _connector_backfill(
                     dry_run=False,
                     artifact=artifact,
                 )
-                wrote = status.startswith(("archived", "appended", "metadata_updated"))
+                wrote = status.startswith(("archived", "appended", "generation_started", "metadata_updated"))
                 changed += int(wrote)
                 items.append({
                     "session_id": artifact.get("session_id", ""),
@@ -223,7 +226,7 @@ def _openclaw_backfill(*, limit: int, target_raw_paths: set[str] | None = None) 
             try:
                 src_stat = src.stat()
             except OSError:
-                report = append_source_file(src, dest)
+                report = append_source_file(src, dest, continue_on_divergence=DIRECT_OPENCLAW_BACKFILL_CONTINUE_ON_DIVERGENCE)
                 dest = Path(str(report.get("archive_path") or dest))
                 wrote = False
                 items.append({
@@ -239,7 +242,7 @@ def _openclaw_backfill(*, limit: int, target_raw_paths: set[str] | None = None) 
                     "memory_write_performed": False,
                 })
                 continue
-            report = append_source_file(src, dest, source_inode=src_stat.st_ino)
+            report = append_source_file(src, dest, source_inode=src_stat.st_ino, continue_on_divergence=DIRECT_OPENCLAW_BACKFILL_CONTINUE_ON_DIVERGENCE)
             dest = Path(str(report.get("archive_path") or dest))
             wrote = bool(report.get("write_performed"))
             if wrote:

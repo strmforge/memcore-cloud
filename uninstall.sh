@@ -111,6 +111,7 @@ if [[ "$OS" == "linux" ]]; then
         time-library-p6-console.service
         time-library-raw-gateway.service
         time-library-dialog-entry.service
+        time-library-codex-mcp-guard.service
         memcore-cloud-p0-watcher.service
         memcore-cloud-p3-recall.service
         memcore-cloud-p4-provider.service
@@ -143,6 +144,7 @@ elif [[ "$OS" == "darwin" ]]; then
         com.memcorecloud.p6-console
         com.memcorecloud.raw-gateway
         com.memcorecloud.dialog-entry
+        com.memcorecloud.codex-mcp-guard
         com.memcorecloud.menu-bar
         com.memcorecloud.console
         ai.memcore.memcore-cloud

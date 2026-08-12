@@ -357,6 +357,15 @@ PRODUCT_ASSET_ROOT = os.path.join(str(MEMCORE_ROOT), "web", "assets")
 CONSOLE_CSRF_TOKEN = os.environ.get("MEMCORE_CONSOLE_TOKEN", "").strip() or secrets.token_urlsafe(32)
 CONSOLE_CSRF_JS = json.dumps(CONSOLE_CSRF_TOKEN)
 CONSOLE_TOKEN_PATH = os.path.join(str(MEMCORE_ROOT), "runtime", "console_token")
+P6_PID_PATH = os.path.join(str(MEMCORE_ROOT), "runtime", "p6-console.pid")
+
+
+def _write_p6_pid_file() -> bool:
+    return _console_runtime_profile.write_owned_pid_file(P6_PID_PATH)
+
+
+def _clear_p6_pid_file() -> None:
+    _console_runtime_profile.clear_owned_pid_file(P6_PID_PATH)
 
 
 def _write_console_token_file() -> None:
@@ -2966,8 +2975,13 @@ def run(port=PORT, host="127.0.0.1"):
     if migration.get("write_performed") or migration.get("asset_prepare_started"):
         print(f"[memcore-m1] vector upgrade migration: {migration.get('state')}")
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"[memcore-m1] console running on http://{host}:{port}")
-    server.serve_forever()
+    _write_p6_pid_file()
+    try:
+        print(f"[memcore-m1] console running on http://{host}:{port}")
+        server.serve_forever()
+    finally:
+        server.server_close()
+        _clear_p6_pid_file()
 
 if __name__ == "__main__":
     import argparse

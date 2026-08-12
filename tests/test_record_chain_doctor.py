@@ -124,6 +124,24 @@ def test_record_doctor_reports_guarded_chain_without_writes():
     assert all("ok" in item for item in payload["checks"])
 
 
+def test_record_doctor_surfaces_active_divergence_generation_without_backfill():
+    doctor = _module()
+
+    payload = doctor.build_record_doctor(
+        guardian_report=_guardian_report(
+            raw_attention_count=1,
+            raw_divergence_generation_active_count=1,
+            backfill_recommended_count=0,
+        ),
+        canonical_index=_canonical_index(),
+    )
+
+    assert payload["doctor_status"] == "attention"
+    assert payload["summary"]["raw_divergence_generation_active_count"] == 1
+    assert payload["summary"]["backfill_recommended_count"] == 0
+    assert "continuation is guarded" in " ".join(payload["next_actions"])
+
+
 def test_record_doctor_escalates_lost_source_and_lost_raw():
     doctor = _module()
 
@@ -139,6 +157,61 @@ def test_record_doctor_escalates_lost_source_and_lost_raw():
     actions = " ".join(payload["next_actions"])
     assert "backfill" in actions
     assert "recovery evidence" in actions
+
+
+def test_record_doctor_does_not_fail_recoverable_lost_source():
+    doctor = _module()
+
+    payload = doctor.build_record_doctor(
+        guardian_report=_guardian_report(
+            lost_source_count=1,
+            lost_source_recoverable_count=1,
+            lost_source_unrecoverable_count=0,
+            lost_source_not_measured_count=0,
+        ),
+        canonical_index=_canonical_index(),
+    )
+
+    assert payload["ok"] is True
+    assert payload["doctor_status"] == "records_guarded"
+    assert payload["summary"]["lost_source_recoverable_count"] == 1
+    assert payload["checks"][3]["ok"] is True
+
+
+def test_record_doctor_observes_unmeasured_lost_source_without_false_red():
+    doctor = _module()
+
+    payload = doctor.build_record_doctor(
+        guardian_report=_guardian_report(
+            lost_source_count=1,
+            lost_source_recoverable_count=0,
+            lost_source_unrecoverable_count=0,
+            lost_source_not_measured_count=1,
+        ),
+        canonical_index=_canonical_index(),
+    )
+
+    assert payload["ok"] is True
+    assert payload["doctor_status"] == "recoverability_evidence_incomplete"
+    assert "not treat unmeasured as lost" in " ".join(payload["next_actions"])
+
+
+def test_record_doctor_fails_closed_when_lost_source_triage_is_inconsistent():
+    doctor = _module()
+
+    payload = doctor.build_record_doctor(
+        guardian_report=_guardian_report(
+            lost_source_count=2,
+            lost_source_recoverable_count=1,
+            lost_source_unrecoverable_count=0,
+            lost_source_not_measured_count=0,
+        ),
+        canonical_index=_canonical_index(),
+    )
+
+    assert payload["ok"] is False
+    assert payload["doctor_status"] == "attention"
+    assert payload["summary"]["lost_source_unrecoverable_count"] == 2
 
 
 def test_record_chain_timeline_uses_source_raw_index_memory_experience_stages():
@@ -162,6 +235,30 @@ def test_record_chain_timeline_uses_source_raw_index_memory_experience_stages():
     ]
     assert stages[2]["status"] == "indexed"
     assert payload["recent_messages"][0]["raw_available"] is True
+
+
+def test_record_chain_timeline_treats_recoverable_retained_raw_as_guarded():
+    doctor = _module()
+    guardian = _guardian_report(
+        lost_source_count=1,
+        lost_source_recoverable_count=1,
+        lost_source_unrecoverable_count=0,
+        lost_source_not_measured_count=0,
+    )
+    guardian["records"][0].update({
+        "guard_status": "source_missing_recoverable_from_raw",
+        "raw_current": False,
+        "source_exists": False,
+    })
+
+    payload = doctor.build_record_chain_timeline(
+        guardian_report=guardian,
+        canonical_index=_canonical_index(),
+    )
+
+    chain = payload["record_chains"][0]
+    assert chain["chain_status"] == "guarded"
+    assert chain["stages"][1]["status"] == "guarded"
 
 
 def test_record_chain_replay_is_preview_not_raw_replacement():

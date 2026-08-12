@@ -16,7 +16,7 @@ J2-J7 Runtime 集成：
 - recall_mode=substring: 关键词匹配（experiences 表）
 - recall_mode=vector: 模型感知 LanceDB 召回；资产未就绪时回落 substring+FTS5
 """
-import os, json, glob, argparse, sys, re, importlib.util, time, threading
+import os, json, glob, argparse, sys, re, importlib.util, time, threading, subprocess, secrets
 from datetime import datetime, timezone
 from collections import defaultdict
 from pathlib import Path
@@ -128,6 +128,7 @@ try:
         default_index_path as _fts5_default_index_path,
         memory_doc_id as _fts5_memory_doc_id,
         search_index as _fts5_search_index,
+        source_signature_digest as _fts5_source_signature_digest,
         fts5_build_background as _fts5_build_background,
         fts5_build_or_catchup as _fts5_build_or_catchup,
         fts5_status as _fts5_status,
@@ -142,6 +143,7 @@ except Exception:
             default_index_path as _fts5_default_index_path,
             memory_doc_id as _fts5_memory_doc_id,
             search_index as _fts5_search_index,
+            source_signature_digest as _fts5_source_signature_digest,
             fts5_build_background as _fts5_build_background,
             fts5_build_or_catchup as _fts5_build_or_catchup,
             fts5_status as _fts5_status,
@@ -155,6 +157,7 @@ except Exception:
         _fts5_default_index_path = None
         _fts5_memory_doc_id = None
         _fts5_search_index = None
+        _fts5_source_signature_digest = None
         def _fts5_build_background(docs): pass
         def _fts5_build_or_catchup(docs): return {"ok": True, "skipped": True, "reason": "module_unavailable"}
         def _fts5_status(): return {"fts5_enabled": False, "reason": "module_unavailable"}
@@ -1405,7 +1408,7 @@ def load_memories():
                         r["_source_refs"] = json.loads(r.get("source_refs", "{}"))
                     except:
                         r["_source_refs"] = {}
-                    r = attach_archive_card(_normalize_memory_record_node(r))
+                    r = _normalize_memory_record_node(r)
 
                     # J2 去重：基于 exp_id + lifecycle_version
                     exp_id = r.get("exp_id", "")
@@ -1428,10 +1431,16 @@ def load_memories():
 
     return memories
 
+_QUERY_TERMS_CACHE = {}
+
+
 def _query_terms(query):
     q = str(query or "").strip().lower()
     if not q:
-        return []
+        return ()
+    cached = _QUERY_TERMS_CACHE.get(q)
+    if cached is not None:
+        return cached
     terms = []
 
     def add(term):
@@ -1455,7 +1464,11 @@ def _query_terms(query):
         compact = compact.replace(filler, " ")
     for term in re.split(r"[\s,，。；;：:、/]+", compact):
         add(term)
-    return terms
+    result = tuple(terms)
+    if len(_QUERY_TERMS_CACHE) >= 256:
+        _QUERY_TERMS_CACHE.clear()
+    _QUERY_TERMS_CACHE[q] = result
+    return result
 
 
 def _source_refs_for_filter(memory):
@@ -1490,12 +1503,19 @@ def filter_memories(
     computer_name_filter = str(computer_name_filter or "").strip()
     session_id_filter = str(session_id_filter or "").strip()
     canonical_window_id_filter = str(canonical_window_id_filter or "").strip()
+    query_terms = _query_terms(query) if query else ()
+    source_refs_needed = bool(
+        source_system_filter
+        or computer_name_filter
+        or session_id_filter
+        or canonical_window_id_filter
+    )
     results = []
     for m in memories:
         # type filter
         if type_filter and m["_type"] not in type_filter:
             continue
-        sr = _source_refs_for_filter(m)
+        sr = _source_refs_for_filter(m) if source_refs_needed else {}
         is_xingce_candidate = m.get("_type") == "xingce_work_experience_candidate" or bool(m.get("_xingce"))
         if source_system_filter and not is_xingce_candidate and sr.get("source_system", "") != source_system_filter:
             continue
@@ -1520,12 +1540,13 @@ def filter_memories(
             if sf not in scope:
                 continue
         # query filter (关键词匹配)
-        if query:
-            terms = _query_terms(query)
-            text_parts = [m.get("summary", ""), m.get("detail", "")]
+        if query_terms:
+            summary = str(m.get("summary", "")).lower()
+            detail = str(m.get("detail", "")).lower()
+            matched = any(term in summary or term in detail for term in query_terms)
             if _is_project_status_memory(m):
                 project_status = m.get("_project_status", {}) if isinstance(m.get("_project_status"), dict) else {}
-                text_parts.extend([
+                project_text = " ".join(str(part or "") for part in [
                     m.get("scope", ""),
                     project_status.get("project", ""),
                     project_status.get("status_id", ""),
@@ -1537,9 +1558,9 @@ def filter_memories(
                     project_status.get("skill_relative_path", ""),
                     project_status.get("skill_path", ""),
                     project_status.get("skill_sha256", ""),
-                ])
-            text = " ".join(str(part or "") for part in text_parts).lower()
-            if terms and not any(term in text for term in terms):
+                ]).lower()
+                matched = matched or any(term in project_text for term in query_terms)
+            if not matched:
                 continue
         results.append(m)
     return results
@@ -1568,19 +1589,157 @@ def _fts5_index_path():
 
 _FTS5_INDEX_LOCK = threading.Lock()
 _FTS5_REFRESH_THREAD = None
+_FTS5_REFRESH_PROCESS = None
 _FTS5_REFRESH_STATUS = {}
+_FTS5_MEMORY_SOURCE_SIGNATURES = {}
 
 
-def _fts5_refresh_worker(memories, index_path, trigger):
-    global _FTS5_REFRESH_THREAD, _FTS5_REFRESH_STATUS
+def _fts5_bind_source_signature(memories, signature):
+    if _fts5_source_signature_digest is None:
+        return ""
+    digest = _fts5_source_signature_digest(signature)
+    _FTS5_MEMORY_SOURCE_SIGNATURES[id(memories)] = digest
+    while len(_FTS5_MEMORY_SOURCE_SIGNATURES) > 4:
+        _FTS5_MEMORY_SOURCE_SIGNATURES.pop(next(iter(_FTS5_MEMORY_SOURCE_SIGNATURES)))
+    return digest
+
+
+def _fts5_expected_source_signature(memories):
+    digest = _FTS5_MEMORY_SOURCE_SIGNATURES.get(id(memories), "")
+    if digest:
+        return digest
+    if memories is MEMORIES_CACHE and MEMORIES_CACHE_SIGNATURE:
+        return _fts5_bind_source_signature(memories, MEMORIES_CACHE_SIGNATURE)
+    return ""
+
+
+def _fts5_current_source_signature():
+    if _fts5_source_signature_digest is None:
+        return ""
+    return _fts5_source_signature_digest(_memories_source_signature())
+
+
+def _fts5_refresh_lock_path(index_path):
+    return f"{index_path}.refresh.lock"
+
+
+def _fts5_refresh_debounce_seconds():
     try:
-        report = _fts5_build_index(memories, index_path)
+        configured = float(os.environ.get("MEMCORE_FTS5_REFRESH_DEBOUNCE_SECONDS") or "300")
+    except (TypeError, ValueError):
+        configured = 300.0
+    return max(0.0, min(configured, 3600.0))
+
+
+def _fts5_refresh_debounce_remaining():
+    debounce_seconds = _fts5_refresh_debounce_seconds()
+    if debounce_seconds <= 0:
+        return 0.0
+    mtimes = []
+    for entry in _memories_source_signature():
+        if not isinstance(entry, tuple) or len(entry) < 2:
+            continue
+        mtime_ns = entry[1]
+        if isinstance(mtime_ns, int):
+            mtimes.append(mtime_ns / 1_000_000_000.0)
+    if not mtimes:
+        return 0.0
+    quiet_seconds = max(0.0, time.time() - max(mtimes))
+    return max(0.0, debounce_seconds - quiet_seconds)
+
+
+def _fts5_process_alive(pid):
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _fts5_acquire_refresh_lock(index_path, token, trigger):
+    lock_path = _fts5_refresh_lock_path(index_path)
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(2):
+        try:
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                state = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+                age = max(0.0, time.time() - os.path.getmtime(lock_path))
+            except Exception:
+                state, age = {}, 0.0
+            if _fts5_process_alive(state.get("pid")) or age < 60.0:
+                return "", "already_running"
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({
+                "token": token,
+                "pid": 0,
+                "trigger": trigger,
+                "started_at_epoch": time.time(),
+            }, handle, sort_keys=True)
+        return lock_path, "acquired"
+    return "", "already_running"
+
+
+def _fts5_release_refresh_lock(lock_path, token):
+    if not lock_path:
+        return
+    try:
+        state = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if state.get("token") != token:
+        return
+    try:
+        os.unlink(lock_path)
+    except FileNotFoundError:
+        pass
+
+
+def _fts5_refresh_worker(process, result_path, lock_path, token, trigger):
+    global _FTS5_REFRESH_THREAD, _FTS5_REFRESH_PROCESS, _FTS5_REFRESH_STATUS
+    try:
+        returncode = process.wait()
+        try:
+            report = json.loads(Path(result_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "error": f"refresh_receipt_unavailable:{type(exc).__name__}",
+                "doc_count": 0,
+            }
+        if returncode and report.get("ok"):
+            report["ok"] = False
+            report["error"] = f"refresh_worker_exit_{returncode}"
         _FTS5_REFRESH_STATUS = {
             "ok": bool(report.get("ok")),
             "trigger": trigger,
             "completed_at": report.get("built_at", ""),
             "doc_count": int(report.get("doc_count") or 0),
             "error": report.get("error"),
+            "worker_pid": int(report.get("worker_pid") or process.pid or 0),
+            "atomic_publish": bool(report.get("atomic_publish")),
         }
     except Exception as exc:
         _FTS5_REFRESH_STATUS = {
@@ -1589,31 +1748,136 @@ def _fts5_refresh_worker(memories, index_path, trigger):
             "completed_at": "",
             "doc_count": 0,
             "error": f"{type(exc).__name__}: {exc}",
+            "worker_pid": int(getattr(process, "pid", 0) or 0),
+            "atomic_publish": False,
         }
     finally:
+        try:
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
+        _fts5_release_refresh_lock(lock_path, token)
         with _FTS5_INDEX_LOCK:
             _FTS5_REFRESH_THREAD = None
+            _FTS5_REFRESH_PROCESS = None
 
 
-def _schedule_fts5_refresh(memories, index_path, trigger):
-    global _FTS5_REFRESH_THREAD, _FTS5_REFRESH_STATUS
+def _schedule_fts5_refresh(
+    memories,
+    index_path,
+    trigger,
+    expected_source_signature="",
+    *,
+    bypass_debounce=False,
+):
+    global _FTS5_REFRESH_THREAD, _FTS5_REFRESH_PROCESS, _FTS5_REFRESH_STATUS
     with _FTS5_INDEX_LOCK:
         if _FTS5_REFRESH_THREAD is not None and _FTS5_REFRESH_THREAD.is_alive():
             return "already_running"
+        debounce_remaining = 0.0 if bypass_debounce else _fts5_refresh_debounce_remaining()
+        if debounce_remaining > 0:
+            _FTS5_REFRESH_STATUS = {
+                "ok": False,
+                "trigger": trigger,
+                "completed_at": "",
+                "doc_count": 0,
+                "error": None,
+                "worker_pid": 0,
+                "atomic_publish": False,
+                "deferred_seconds": round(debounce_remaining, 3),
+            }
+            return "deferred_source_change"
+        token = secrets.token_hex(12)
+        lock_path, lock_state = _fts5_acquire_refresh_lock(index_path, token, trigger)
+        if lock_state != "acquired":
+            return lock_state
+        result_path = f"{index_path}.refresh.{token}.json"
+        tool_path = Path(__file__).resolve().parents[1] / "tools" / "build_fts5_recall_index.py"
+        command = [
+            sys.executable,
+            str(tool_path),
+            "--index-path",
+            str(index_path),
+            "--result-path",
+            result_path,
+            "--lock-path",
+            lock_path,
+            "--lock-token",
+            token,
+        ]
+        if expected_source_signature:
+            command.extend(["--expected-source-signature", expected_source_signature])
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except Exception:
+            _fts5_release_refresh_lock(lock_path, token)
+            raise
+        try:
+            Path(lock_path).write_text(json.dumps({
+                "token": token,
+                "pid": process.pid,
+                "trigger": trigger,
+                "started_at_epoch": time.time(),
+            }, sort_keys=True), encoding="utf-8")
+            os.chmod(lock_path, 0o600)
+        except Exception:
+            pass
         _FTS5_REFRESH_STATUS = {
             "ok": False,
             "trigger": trigger,
             "completed_at": "",
             "doc_count": 0,
             "error": None,
+            "worker_pid": int(process.pid or 0),
+            "atomic_publish": False,
+            "deferred_seconds": 0.0,
         }
         _FTS5_REFRESH_THREAD = threading.Thread(
             target=_fts5_refresh_worker,
-            args=(list(memories), index_path, trigger),
+            args=(process, result_path, lock_path, token, trigger),
             daemon=True,
         )
+        _FTS5_REFRESH_PROCESS = process
         _FTS5_REFRESH_THREAD.start()
     return "scheduled"
+
+
+def _schedule_startup_fts5_refresh(memories):
+    """Migrate legacy indexes without making ordinary source churn eager."""
+    state = _fts5_status()
+    expected_source_signature = _fts5_expected_source_signature(memories)
+    if not (state.get("exists") or state.get("fts5_enabled")):
+        return "not_configured"
+    if state.get("source_signature") == expected_source_signature:
+        return "current"
+
+    missing_source_signature = bool(
+        state.get("exists")
+        and expected_source_signature
+        and not state.get("source_signature")
+    )
+    trigger = (
+        "startup_source_signature_missing"
+        if missing_source_signature
+        else "startup_corpus_change"
+    )
+    return _schedule_fts5_refresh(
+        memories,
+        _fts5_index_path(),
+        trigger,
+        expected_source_signature=expected_source_signature,
+        bypass_debounce=missing_source_signature,
+    )
 
 
 def _copy_with_fts5_rank(memory, row, rank_index):
@@ -1642,32 +1906,57 @@ def _fts5_ordered_memories(memories, query, top_k):
             "matched_count": 0,
             "raw_matched_count": 0,
         }
-    expected_signature = _fts5_corpus_signature(memories)
+    expected_source_signature = _fts5_current_source_signature()
     index_path = _fts5_index_path()
     result = _fts5_search_index(
         query=query,
         index_path=index_path,
         limit=max(int(top_k or 5) * 8, 20),
-        expected_signature=expected_signature,
+        expected_source_signature=expected_source_signature,
     )
     initial_status = result.get("status") or {}
     initial_error = str(initial_status.get("error") or "")
     refresh_needed = initial_error in {"index_missing", "index_not_ready"} or bool(initial_status.get("stale"))
     refresh_trigger = (
         initial_error if initial_error in {"index_missing", "index_not_ready"}
-        else "corpus_signature_mismatch" if initial_status.get("stale")
+        else str(initial_status.get("stale_reason") or "source_snapshot_unknown") if initial_status.get("stale")
         else ""
     )
     refresh_schedule = ""
     if refresh_needed:
-        refresh_schedule = _schedule_fts5_refresh(memories, index_path, refresh_trigger)
+        refresh_schedule = _schedule_fts5_refresh(
+            memories,
+            index_path,
+            refresh_trigger,
+            expected_source_signature=expected_source_signature,
+        )
     rows = result.get("rows") or []
     doc_map = {}
-    for memory in memories:
-        try:
-            doc_map[_fts5_memory_doc_id(memory)] = memory
-        except Exception:
-            continue
+    if rows:
+        requested_doc_ids = {str(row.get("doc_id") or "") for row in rows}
+        requested_exp_ids = {
+            str(row.get("exp_id") or "")
+            for row in rows
+            if str(row.get("exp_id") or "")
+        }
+        anonymous_doc_ids = requested_doc_ids - requested_exp_ids
+        for memory in memories:
+            exp_id = str(memory.get("exp_id") or "")
+            if exp_id:
+                if exp_id in requested_exp_ids:
+                    doc_map[exp_id] = memory
+                continue
+            if not anonymous_doc_ids:
+                continue
+            try:
+                doc_id = _fts5_memory_doc_id(memory)
+            except Exception:
+                continue
+            if doc_id in anonymous_doc_ids:
+                doc_map[doc_id] = memory
+                anonymous_doc_ids.remove(doc_id)
+                if not anonymous_doc_ids and len(doc_map) >= len(requested_doc_ids):
+                    break
     ordered = []
     seen = set()
     for rank_index, row in enumerate(rows):
@@ -1687,6 +1976,10 @@ def _fts5_ordered_memories(memories, query, top_k):
     status["auto_refresh_attempted"] = bool(refresh_needed or refresh_completed)
     status["auto_refresh_completed"] = refresh_completed
     status["auto_refresh_pending"] = refresh_schedule in {"scheduled", "already_running"}
+    status["auto_refresh_deferred"] = refresh_schedule == "deferred_source_change"
+    status["auto_refresh_debounce_remaining_seconds"] = float(
+        _FTS5_REFRESH_STATUS.get("deferred_seconds") or 0.0
+    )
     status["auto_refresh_schedule"] = refresh_schedule
     status["auto_refresh_trigger"] = (
         refresh_trigger or (_FTS5_REFRESH_STATUS.get("trigger", "") if refresh_completed else "")
@@ -2197,11 +2490,13 @@ def _ensure_bm25_seg_index(memories):
             return _BM25_MANIFEST_CACHE["manifest"], "cache_hit"
     manifest = _load_manifest()
     if manifest and manifest.get("total_docs", 0) > 0:
+        manifest_signature = manifest.get("signature")
+        manifest_doc_count = int(manifest.get("total_docs") or 0)
         with _BM25_INDEX_LOCK:
             _BM25_MANIFEST_CACHE["manifest"] = manifest
-            _BM25_MANIFEST_CACHE["signature"] = sig
-            _BM25_MANIFEST_CACHE["N"] = len(memories)
-        if manifest.get("signature") == sig and manifest.get("total_docs", 0) == len(memories):
+            _BM25_MANIFEST_CACHE["signature"] = manifest_signature
+            _BM25_MANIFEST_CACHE["N"] = manifest_doc_count
+        if manifest_signature == sig and manifest_doc_count == len(memories):
             return manifest, "cache_hit"
         return manifest, "stale_served"
     empty = {"segments": [], "total_docs": 0, "doc_freq": {},
@@ -2360,7 +2655,7 @@ def _compute_memtable_idf():
     return idf_map, avg_dl
 
 
-def _compute_bm25_scores(memories, query, k1=1.5, b=0.75):
+def _compute_bm25_scores(memories, query, k1=1.5, b=0.75, corpus_memories=None):
     """Compute BM25 scores using segment index + bounded memtable.
 
     Returns list of (bm25_score, memory) tuples, sorted descending.
@@ -2372,15 +2667,42 @@ def _compute_bm25_scores(memories, query, k1=1.5, b=0.75):
     query_tokens = _tokenize_bm25(query)
     if not query_tokens:
         return [(0.0, m) for m in memories]
-    manifest, index_status = _ensure_bm25_seg_index(memories)
-    if index_status == "cold_start" and len(memories) > _BM25_MEMTABLE_MAX_DOCS:
-        _trigger_bm25_background_build([dict(m) for m in memories])
+    corpus = corpus_memories if corpus_memories is not None else memories
+    manifest, index_status = _ensure_bm25_seg_index(corpus)
+    _BM25_PATH_CONTEXT.last_query_status = index_status
+    if index_status == "cold_start" and len(corpus) > _BM25_MEMTABLE_MAX_DOCS:
+        _trigger_bm25_background_build([dict(m) for m in corpus])
     elif index_status == "stale_served":
         mtotal = manifest.get("total_docs", 0)
-        if mtotal > 0 and len(memories) > mtotal * 2 and len(memories) > _BM25_MEMTABLE_MAX_DOCS:
-            _trigger_bm25_background_build(memories)
+        if mtotal > 0 and len(corpus) > mtotal * 2 and len(corpus) > _BM25_MEMTABLE_MAX_DOCS:
+            _trigger_bm25_background_build(corpus)
     idf_map = manifest.get("idf_map", {})
     avg_dl = manifest.get("avg_dl", 1.0)
+
+    # A query filter is a view over the corpus, not an incremental corpus write.
+    # Score current text against the manifest IDF read-only. The segment files
+    # are forward-document caches; reopening all of them for a filtered view is
+    # slower and creates allocator churn in the long-lived P3 process.
+    if corpus_memories is not None:
+        if not idf_map and len(memories) <= _BM25_MEMTABLE_MAX_DOCS:
+            transient = _build_memtable_segment(memories)
+            idf_map = transient.get("idf_map", {})
+            avg_dl = transient.get("avg_dl", 1.0)
+        scored = [
+            (_bm25_score_single(memory, query_tokens, idf_map, avg_dl, k1, b), memory)
+            for memory in memories
+        ]
+        if scored:
+            max_score = max(score for score, _memory in scored)
+            if max_score > 0:
+                scored = [(score / max_score, memory) for score, memory in scored]
+            else:
+                # An all-zero auxiliary leg must not let source-file order
+                # overturn decision/lifecycle ranking during RRF fusion.
+                scored = [(rank_memory(memory, query), memory) for memory in memories]
+        scored.sort(key=lambda item: -item[0])
+        return scored
+
     seg_exp_id_index = {}
     for si in manifest.get("segments", []):
         seg = _load_segment(si["id"])
@@ -2759,6 +3081,21 @@ def _memories_source_signature():
             "latest.json",
         )
     )
+    xingce_root = _xingce_project_root()
+    paths.extend(sorted(glob.glob(os.path.join(
+        xingce_root,
+        "output",
+        "xingce_work_experience",
+        "candidates",
+        "xingce-*-candidate.json",
+    ))))
+    paths.extend(sorted(glob.glob(os.path.join(
+        xingce_root,
+        "output",
+        "xingce_work_experience",
+        "actions",
+        "*.jsonl",
+    ))))
     return _file_signature(paths)
 
 
@@ -3240,23 +3577,20 @@ def _memory_background_reload(sig):
         MEMORIES_CACHE = new_memories
         CACHE_TIME["ts"] = datetime.now(timezone.utc).timestamp()
         MEMORIES_CACHE_SIGNATURE = sig
+        expected_source_signature = _fts5_bind_source_signature(MEMORIES_CACHE, sig)
         _MEMORY_LAST_SERVED_SIGNATURE = sig
         _MEMORY_CACHE_STATUS = "refresh_completed"
         try:
             fts5_state = _fts5_status()
-            expected_signature = (
-                _fts5_corpus_signature(MEMORIES_CACHE)
-                if _fts5_corpus_signature is not None
-                else ""
-            )
             if (
                 (fts5_state.get("exists") or fts5_state.get("fts5_enabled"))
-                and fts5_state.get("corpus_signature") != expected_signature
+                and fts5_state.get("source_signature") != expected_source_signature
             ):
                 _schedule_fts5_refresh(
                     MEMORIES_CACHE,
                     _fts5_index_path(),
                     "memory_reload_corpus_change",
+                    expected_source_signature=expected_source_signature,
                 )
         except Exception:
             pass
@@ -3284,6 +3618,7 @@ def get_memories():
         MEMORIES_CACHE = load_memories()
         CACHE_TIME["ts"] = now
         MEMORIES_CACHE_SIGNATURE = signature
+        _fts5_bind_source_signature(MEMORIES_CACHE, signature)
         _MEMORY_LAST_SERVED_SIGNATURE = signature
         return MEMORIES_CACHE
 
@@ -3745,9 +4080,13 @@ def handle_recall(body):
     bm25_scored = []
     bm25_index_status = "no_index"
     if query and filtered:
-        bm25_scored = _compute_bm25_scores(filtered, query)
+        bm25_scored = _compute_bm25_scores(
+            filtered,
+            query,
+            corpus_memories=memories,
+        )
         bm25_applied = bool(bm25_scored)
-        bm25_index_status = _bm25_corpus_stats().get("index_status", "no_index")
+        bm25_index_status = getattr(_BM25_PATH_CONTEXT, "last_query_status", "no_index")
 
     # 打分排序（使用 lifecycle 增强后的 _adjusted_score）
     keyword_scored = [(rank_memory(m, query), m) for m in filtered]
@@ -3996,7 +4335,8 @@ def run_server(port=None):
         warmup = _warmup_vector_engine()
         print(f"[p3] vector warmup: {warmup}")
     try:
-        _fts5_build_or_catchup(get_memories())
+        startup_memories = get_memories()
+        _schedule_startup_fts5_refresh(startup_memories)
     except Exception:
         pass
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

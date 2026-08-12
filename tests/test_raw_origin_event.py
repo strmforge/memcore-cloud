@@ -85,6 +85,39 @@ def test_raw_origin_event_uses_lost_source_and_lost_raw_labels():
     assert lost_source["origin_label"] == "遗失源"
 
 
+def test_origin_summary_splits_lost_source_recoverability_tri_state():
+    from raw_origin_event import build_raw_origin_event, origin_summary
+
+    records = []
+    for index, value in enumerate((True, False, None), start=1):
+        event = build_raw_origin_event(
+            source_system="claude_desktop",
+            native_session_key=f"session-{index}",
+            raw_path=f"/tmp/raw-{index}.jsonl",
+            source_exists=False,
+            raw_exists=True,
+            content_hash=f"hash-{index}",
+        )
+        records.append({
+            "origin_event": event,
+            "origin_status": "lost_source",
+            "recoverable_from_raw": value,
+            "sync": {},
+        })
+
+    summary = origin_summary(records)
+
+    assert summary["lost_source_count"] == 3
+    assert summary["lost_source_recoverable_count"] == 1
+    assert summary["lost_source_unrecoverable_count"] == 1
+    assert summary["lost_source_not_measured_count"] == 1
+    assert (
+        summary["lost_source_recoverable_count"]
+        + summary["lost_source_unrecoverable_count"]
+        + summary["lost_source_not_measured_count"]
+    ) == summary["lost_source_count"]
+
+
 def test_platform_source_system_is_inlet_not_time_origin():
     from raw_origin_event import build_raw_origin_event
 

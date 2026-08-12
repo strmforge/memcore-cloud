@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -45,6 +47,54 @@ def test_p0_load_checkpoint_recovers_corrupt_file(tmp_path):
 
     p0.save_checkpoint({"source.jsonl": {"offset": 12}})
     assert p0.load_checkpoint()["source.jsonl"]["offset"] == 12
+
+
+def test_p0_save_checkpoint_retries_transient_windows_replace_lock(tmp_path, monkeypatch):
+    p0 = _load_p0()
+    checkpoint = tmp_path / ".checkpoint"
+    p0.CHECKPOINT_FILE = str(checkpoint)
+    real_replace = p0.os.replace
+    calls = []
+    sleeps = []
+
+    def flaky_replace(source, target):
+        calls.append((source, target))
+        if len(calls) < 8:
+            raise PermissionError("transient Windows file lock")
+        real_replace(source, target)
+
+    monkeypatch.setattr(p0.os, "replace", flaky_replace)
+    monkeypatch.setattr(p0.time, "sleep", sleeps.append)
+
+    p0.save_checkpoint({"source.jsonl": {"offset": 12}})
+
+    assert len(calls) == 8
+    assert sleeps == [0.25] * 7
+    assert p0.load_checkpoint()["source.jsonl"]["offset"] == 12
+    assert list(tmp_path.glob(".checkpoint.*.tmp")) == []
+
+
+def test_p0_save_checkpoint_persistent_replace_lock_fails_closed(tmp_path, monkeypatch):
+    p0 = _load_p0()
+    checkpoint = tmp_path / ".checkpoint"
+    p0.CHECKPOINT_FILE = str(checkpoint)
+    calls = []
+    sleeps = []
+
+    def locked_replace(source, target):
+        calls.append((source, target))
+        raise PermissionError("persistent Windows file lock")
+
+    monkeypatch.setattr(p0.os, "replace", locked_replace)
+    monkeypatch.setattr(p0.time, "sleep", sleeps.append)
+
+    with pytest.raises(PermissionError, match="persistent Windows file lock"):
+        p0.save_checkpoint({"source.jsonl": {"offset": 12}})
+
+    assert len(calls) == 20
+    assert sleeps == [0.25] * 19
+    assert not checkpoint.exists()
+    assert list(tmp_path.glob(".checkpoint.*.tmp")) == []
 
 
 def test_p0_claude_desktop_raw_ingest_defaults_to_continuous_local_capture(monkeypatch):
@@ -205,6 +255,126 @@ def test_p0_watch_root_candidates_include_existing_codex_claude_code_and_kiro_ro
     assert ("claude_code_cli", claude_code_root) in roots
     assert ("claude_code_cli", claude_desktop_code_root) in roots
     assert ("kiro", kiro_root) in roots
+
+
+def test_p0_claude_desktop_relay_metadata_is_not_a_raw_ingest_trigger(tmp_path, monkeypatch):
+    p0 = _load_p0()
+    relay_db = tmp_path / "relay" / "local-relay.db"
+    relay_db.parent.mkdir()
+    relay_db.write_bytes(b"relay metadata")
+    leveldb = tmp_path / "Claude" / "IndexedDB" / "https_claude.ai_0.indexeddb.leveldb"
+    leveldb.mkdir(parents=True)
+    leveldb_log = leveldb / "000001.log"
+    leveldb_log.write_bytes(b"source bytes")
+
+    connector = SimpleNamespace(
+        discover_artifacts=lambda limit=80: [
+            {
+                "artifact_type": "local_relay_proxy_request_logs_db",
+                "source_path": str(relay_db),
+            },
+            {
+                "artifact_type": "claude_desktop_indexeddb_leveldb_dir",
+                "source_path": str(leveldb),
+            },
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "claude_desktop_connector", connector)
+    monkeypatch.setattr(p0, "claude_desktop_raw_ingest_enabled", lambda: True)
+
+    signatures = dict(p0._claude_desktop_store_signatures())
+    roots = set(p0._watch_root_candidates(SimpleNamespace(source="claude_desktop")))
+
+    assert str(relay_db) not in signatures
+    assert ("claude_desktop", relay_db.parent) not in roots
+    assert str(leveldb_log) in signatures
+    assert ("claude_desktop", leveldb) in roots
+
+
+def test_p0_claude_desktop_idle_signature_checks_reuse_discovered_paths(tmp_path, monkeypatch):
+    p0 = _load_p0()
+    leveldb = tmp_path / "Claude" / "IndexedDB" / "https_claude.ai_0.indexeddb.leveldb"
+    leveldb.mkdir(parents=True)
+    leveldb_log = leveldb / "000001.log"
+    leveldb_log.write_bytes(b"first")
+    calls = []
+
+    connector = SimpleNamespace(
+        discover_artifacts=lambda limit=80: calls.append(limit) or [
+            {
+                "artifact_type": "claude_desktop_indexeddb_leveldb_dir",
+                "source_path": str(leveldb),
+            },
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "claude_desktop_connector", connector)
+
+    first = p0._claude_desktop_store_signatures()
+    second = p0._claude_desktop_store_signatures()
+    leveldb_log.write_bytes(b"second payload")
+    changed = p0._claude_desktop_store_signatures()
+    refreshed = p0._claude_desktop_store_signatures(force_refresh=True)
+
+    assert calls == [80, 80]
+    assert first == second
+    assert changed != second
+    assert refreshed == changed
+
+
+def test_p0_claude_desktop_change_refreshes_discovered_paths_once(tmp_path, monkeypatch):
+    p0 = _load_p0()
+    store = tmp_path / "Claude" / "Session Storage"
+    store.mkdir(parents=True)
+    source = store / "000001.log"
+    source.write_bytes(b"first")
+    discoveries = []
+    scans = []
+
+    connector = SimpleNamespace(
+        discover_artifacts=lambda limit=80: discoveries.append(limit) or [
+            {
+                "artifact_type": "claude_desktop_session_storage_dir",
+                "source_path": str(store),
+            },
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "claude_desktop_connector", connector)
+    monkeypatch.setattr(p0, "claude_desktop_raw_ingest_enabled", lambda: True)
+    monkeypatch.setattr(
+        p0,
+        "scan_claude_desktop_raw",
+        lambda **kwargs: scans.append(kwargs) or {
+            "ok": True,
+            "candidate_count": 0,
+            "raw_write": {"records_written": 0},
+        },
+    )
+    args = SimpleNamespace(source="claude_desktop", claude_desktop_limit=0)
+    signature_cache = {}
+
+    assert p0._run_claude_desktop_sync_once(args, signature_cache=signature_cache) is False
+    source.write_bytes(b"second payload")
+    assert p0._run_claude_desktop_sync_once(args, signature_cache=signature_cache) is False
+    assert p0._run_claude_desktop_sync_once(args, signature_cache=signature_cache) is False
+
+    assert len(scans) == 2
+    assert discoveries == [80, 80]
+
+
+def test_p0_claude_desktop_candidate_only_scan_is_not_source_work(monkeypatch):
+    p0 = _load_p0()
+    result = {
+        "ok": True,
+        "candidate_count": 17,
+        "raw_write": {"records_written": 0},
+    }
+    monkeypatch.setattr(p0, "scan_claude_desktop_raw", lambda **kwargs: result)
+
+    args = SimpleNamespace(source="claude_desktop", claude_desktop_limit=0)
+    assert p0._run_claude_desktop_sync_once(args, force=True) is False
+
+    result["raw_write"]["records_written"] = 1
+    assert p0._run_claude_desktop_sync_once(args, force=True) is True
 
 
 def test_p0_watch_event_relevance_filters_checkpoint_and_accepts_dest_path():

@@ -44,7 +44,7 @@ def test_zhiyi_skill_package_is_platform_neutral():
     lowered = skill.lower()
     compact_skill = re.sub(r"\s+", " ", skill)
 
-    assert "version: 2026.7.18" in skill
+    assert "version: 2026.8.7" in skill
     assert "prompt_version: 6" in skill
     assert "description: >-" in skill
     assert "Use when the user refers" in skill
@@ -224,11 +224,13 @@ def test_full_installers_install_codex_skill_and_register_mcp_when_available():
         assert "time-library.backup" in text
         assert "Codex skill:" in text
         assert "front-door discovery" in text or "front_door_port" in text
-        assert "codex mcp add time-library" in text
         assert "Codex MCP registered" in text
         assert "codex_mcp_bridge.py" in text
-        assert "configure_codex_mcp_policy.py" in text
-        assert "scoped recall/ack approval" in text
+        assert "codex_mcp_config_guard.py" in text
+        assert "protected relay-preserving guard" in text
+        assert "Codex MCP config guard" in text
+        assert "codex mcp add time-library" not in text
+        assert "codex mcp remove time-library" not in text
         assert "--create --json" in text
         assert "receipt_url" in text
         assert "enable_receipts" in text
@@ -327,6 +329,120 @@ def test_windows_guardian_preserves_source_all_watcher_contract():
     assert '$would.applies_to -notcontains "zhiyi_frontstage"' not in smoke
 
 
+def test_windows_guardian_uses_watcher_owned_pid_anchor_and_bounded_logs():
+    text = (ROOT / "tools" / "windows_guardian.ps1").read_text(encoding="utf-8")
+    watcher_start = text.split("function Start-P0WatcherIfMissing {", 1)[1].split(
+        "function Start-MemcoreServiceIfMissing {", 1
+    )[0]
+
+    assert "return ,$ids" in text
+    assert "Get-P0WatcherPidAnchorProcesses" in text
+    assert "$WatcherPidStartToleranceSeconds = 120" in text
+    assert "$delta -le $WatcherPidStartToleranceSeconds" in text
+    assert 'Name -notmatch "^python(?:w)?\\.exe$"' in text
+    assert "Start-HiddenCommandProcess -CmdPath $cmdPath | Out-Null" in watcher_start
+    assert "Set-Content" not in watcher_start
+
+    assert "$GuardianLogMaxBytes = 5MB" in text
+    assert "$GuardianLogRetention = 2" in text
+    assert "function Invoke-BoundedLogRotation" in text
+    assert "[System.IO.Compression.GZipStream]::new" in text
+    assert 'Write-Utf8NoBom -Path $Path -Text ""' in text
+    assert 'Invoke-BoundedLogRotation -Path $GuardianLog' in text
+    assert 'Invoke-BoundedLogRotation -Path $GuardianErr' in text
+
+
+def test_windows_guardian_persists_safe_bounded_record_summary_without_implicit_backfill():
+    text = (ROOT / "tools" / "windows_guardian.ps1").read_text(encoding="utf-8")
+    evidence = text.split("function ConvertTo-SafeRecordGuardianSummary {", 1)[1].split(
+        "function Invoke-RecordGuardianBackfillIfNeeded {", 1
+    )[0]
+    normal_flow = text.split("try {", 1)[-1]
+
+    assert "$RecordGuardianCacheMaxAgeSeconds = 1800" in text
+    assert "function Update-RecordGuardianEvidence" in evidence
+    assert "function Get-ThrottledRecordGuardianEvidence" in evidence
+    assert "fast_compact_api" in evidence
+    assert "details_persisted = $false" in evidence
+    assert "guardian_status_cache" in evidence
+    assert "stale_guardian_status_cache" in evidence
+    assert "last_refresh_attempt_at" in evidence
+    assert "refresh_attempt_age_seconds" in evidence
+    assert "refresh_throttled = $true" in evidence
+    assert "refresh throttled attempt_age_seconds=" in evidence
+    assert "$script:RecordGuardianStatusAttempted = $true" in evidence
+    assert "P6 guardian API already attempted; fallback to connector" in text
+    for field in (
+        "raw_attention_count",
+        "raw_divergence_generation_active_count",
+        "lost_source_count",
+        "lost_source_recoverable_count",
+        "lost_source_unrecoverable_count",
+        "lost_source_not_measured_count",
+        "lost_raw_count",
+        "backfill_recommended_count",
+    ):
+        assert field in evidence
+    assert "$hasCompleteTriage" in evidence
+    assert "$unrecoverableCount = $lostSourceCount" in evidence
+    assert evidence.count(
+        "ConvertTo-SafeRecordGuardianSummary -Status ([pscustomobject]@{ summary = $evidence.summary })"
+    ) == 2
+    for forbidden in ("records =", "session_id", "source_path", "raw_path"):
+        assert forbidden not in evidence
+    assert "Update-RecordGuardianEvidence" in normal_flow
+    assert "if ($Backfill) { Invoke-CodexRawBackfillIfNeeded }" in normal_flow
+
+
+def test_windows_native_smoke_fails_closed_on_incomplete_lost_source_triage():
+    text = (ROOT / "tools" / "windows_native_smoke.ps1").read_text(encoding="utf-8")
+    evidence = text.split("function Test-GuardianAndTray {", 1)[1].split(
+        "function Test-CodexCaptureStatus {", 1
+    )[0]
+
+    for field in (
+        "lost_source_recoverable_count",
+        "lost_source_unrecoverable_count",
+        "lost_source_not_measured_count",
+    ):
+        assert field in evidence
+    assert "$hasCompleteTriage" in evidence
+    assert "$lostSourceRecoverable + $lostSourceUnrecoverable + $lostSourceNotMeasured" in evidence
+    assert "$lostSourceUnrecoverable = $lostSourceCount" in evidence
+
+
+def test_windows_guardian_uses_service_owned_pid_and_port_anchors():
+    guardian = (ROOT / "tools" / "windows_guardian.ps1").read_text(encoding="utf-8")
+    installer = (ROOT / "tools" / "windows_full_install.ps1").read_text(encoding="utf-8")
+
+    assert "$ServicePidStartToleranceSeconds = 120" in guardian
+    assert "Get-MemcoreServicePidAnchorProcesses" in guardian
+    assert "Resolve-MemcoreServicePort" in guardian
+    assert "Test-ProcessTreeContainsAny -TreeIds $treeIds -ProcessIds $listenerIds" in guardian
+    assert "(-not [string]::IsNullOrWhiteSpace($executablePath)) -and" in guardian
+    assert "$executablePath -ne $venvPython" in guardian
+    assert 'Join-Path $InstallRoot ".venv\\Scripts\\python.exe"' in guardian
+    assert "Set-MemcoreServicePidAnchor" in guardian
+    assert '[System.IO.File]::SetLastWriteTimeUtc($pidPath, $started)' in guardian
+    assert "$currentPid -ne $canonicalPid" in guardian
+    assert "-not $pythonIds.Contains([int]$_.ParentProcessId)" in guardian
+    assert "Get-StartedServiceProcessTree" in guardian
+    service_start = guardian.split("function Start-MemcoreServiceIfMissing {", 1)[1].split(
+        "function Start-RuntimeServicesIfMissing {", 1
+    )[0]
+    assert "Get-StartedServiceProcessTree -RootProcessId $rootPid -Port $runtimePort" in service_start
+    assert 'Set-Content -LiteralPath (Join-Path $RuntimeDir "$Name.pid")' not in service_start
+    assert "$ready = ($runtimePort -gt 0)" in service_start
+    assert "Set-CanonicalStartedServicePid" in installer
+    canonicalizer = installer.split("function Set-CanonicalStartedServicePid {", 1)[1].split(
+        "function Start-MemcoreService {", 1
+    )[0]
+    assert 'if ($Name -eq "p0-watcher") { return }' in canonicalizer
+    assert "Get-OwnedInstallProcessRecords" in canonicalizer
+    assert "ExecutablePath" in canonicalizer
+    assert '[System.IO.File]::SetLastWriteTimeUtc($PidPath, $started)' in canonicalizer
+
+
 def test_codex_zhiyi_skill_status_reports_duplicate_backups_and_mcp(tmp_path):
     helper = _load_codex_skill_status()
     codex_home = tmp_path / ".codex"
@@ -370,7 +486,7 @@ def test_codex_skill_status_accepts_primary_time_library_skill_and_legacy_mcp(tm
     main = codex_home / "skills" / "time-library"
     main.mkdir(parents=True)
     (main / "SKILL.md").write_text(
-        '---\nname: time-library\nversion: 2026.7.18\nprompt_version: 6\ndescription: Use when prior context matters; call time_library_recall.\n---\n',
+        '---\nname: time-library\nversion: 2026.8.7\nprompt_version: 6\ndescription: Use when prior context matters; call time_library_recall.\n---\n',
         encoding="utf-8",
     )
     (codex_home / "config.toml").write_text(
@@ -478,19 +594,28 @@ def test_windows_native_smoke_is_repeatable_no_recall_and_not_vm_based():
     assert "capture_independent_of_mcp" in smoke
     assert "$consoleUrl = $RawGatewayUrl" in guardian_section
     assert "raw_sync" in smoke
-    assert "Codex source records are ahead of Time Library raw" in smoke
+    assert "$captureStatusMaxAttempts = 8" in smoke
+    assert "$captureStatusPollMilliseconds = 5000" in smoke
+    assert 'Start-Sleep -Milliseconds $captureStatusPollMilliseconds' in smoke
+    assert 'raw_missing", "raw_lagging_sla_breach"' in smoke
+    assert "Codex source records remain ahead after {0} bounded checks" in smoke
+    assert "raw_archive_total_lag_bytes" in smoke
+    assert "raw_archive_max_lag_milliseconds" in smoke
+    assert "raw_lag_sla_breach_count" in smoke
     assert "codex_consumer_mcp_optional" in smoke
     assert "local capture still uses source files" in smoke
     assert "Test-CodexProviderBucket" in smoke
     assert "codex_provider_bucket" in smoke
     assert "provider_bucket_matches_section" in smoke
-    assert "codex_provider_bucket_drift" in smoke
+    assert "codex_provider_route_binding" in smoke
+    assert "provider_bucket_name_is_route_identity = $false" in smoke
+    assert 'ToLowerInvariant() -ne "token"' not in smoke
     assert "127.0.0.1:15721" in smoke
     assert "codex_local_proxy_health" in smoke
     assert "models_404_not_fatal" in smoke
     assert "diagnostic only" in smoke
     assert "codex_responses_probe" in smoke
-    assert "provider bucket drift breaks Codex even when the relay is healthy" in smoke
+    assert "provider bucket names are host-defined" in smoke
     assert "Read-CodexConfigForSmoke" in smoke
     assert "Convert-TomlScalarForSmoke" in smoke
     assert "Get-HttpStatusCodeForSmoke" in smoke
@@ -523,11 +648,15 @@ def test_windows_native_smoke_is_repeatable_no_recall_and_not_vm_based():
     assert "Register-WindowsAutostart" in installer
     assert "New-ScheduledTaskTrigger -AtLogOn" in installer
     assert "RepetitionInterval (New-TimeSpan -Minutes 5)" in installer
+    assert "$guardPeriodicTrigger = New-ScheduledTaskTrigger" in installer
+    assert "$guardTriggers = @($guardLogonTrigger, $guardPeriodicTrigger)" in installer
+    assert "-Trigger $guardTriggers" in installer
     assert "MemcoreCloudGuardianLogon" in installer
     assert "MemcoreCloudGuardianHealth" in installer
     assert "MemcoreCloudTray" in installer
     assert "System32\\wscript.exe" in installer
-    assert 'New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianArgs' in installer
+    assert 'New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianLogonArgs' in installer
+    assert 'New-ScheduledTaskAction -Execute $wscriptExe -Argument $guardianHealthArgs' in installer
     assert "-STA -ExecutionPolicy Bypass -WindowStyle Hidden" in installer
     assert "Start-ScheduledTask -TaskName \"MemcoreCloudTray\"" in installer
     assert "MemcoreCloudGuardianLogon" in uninstaller
@@ -537,13 +666,21 @@ def test_windows_native_smoke_is_repeatable_no_recall_and_not_vm_based():
     assert "windows_guardian.ps1" in uninstaller
     assert "windows_guardian" in guardian
     assert "windows_guardian.ps1" in hidden_guardian
-    assert "shell.Run commandLine, 0, True" in hidden_guardian
+    assert "exitCode = shell.Run(commandLine, 0, True)" in hidden_guardian
+    assert "WScript.Quit exitCode" in hidden_guardian
     assert "-StartWatcher -Quiet" in hidden_guardian
     assert "-StartWatcher -Backfill -Quiet" not in hidden_guardian
     assert "guardian_already_running" in guardian
     assert "[System.IO.File]::Open" in guardian
     assert "[System.IO.FileShare]::None" in guardian
     assert "Ensure-GuardianHealthTaskSchedule" in guardian
+    assert "Ensure-CodexMcpGuardTaskHealth" in guardian
+    assert "Test-CodexMcpGuardTaskOwned" in guardian
+    assert "Get-CodexMcpGuardProcesses" in guardian
+    assert 'Add-Check -Name "codex_mcp_guard_task"' in guardian
+    assert 'Start-ScheduledTask -TaskName $taskName -ErrorAction Stop' in guardian
+    assert "--once" in guardian
+    assert "one_shot_reconcile" in guardian
     assert '"migrated interval to PT5M"' in guardian
     assert "shouldWriteStatus" in guardian
     assert "existing.generated_at" in guardian
@@ -775,22 +912,81 @@ def test_codex_mcp_bridge_is_installed_for_current_window_routing():
     assert "CODEX_THREAD_ID" in bridge
     assert "MEMCORE_CODEX_SESSION_ID" in bridge
     assert "MEMCORE_CODEX_CANONICAL_WINDOW_ID" in bridge
+    assert '"--root"' in bridge
     assert "consumer\", \"codex\"" in bridge
     assert 'mode in {"preflight", "work_preflight", "agent_work_preflight"}' in bridge
     assert "codex_compact" in bridge
     for text in (mac, linux, windows):
         assert "codex_mcp_bridge.py" in text
-        assert "configure_codex_mcp_policy.py" in text
-        assert "codex mcp add time-library" in text
+        assert "codex_mcp_config_guard.py" in text
+        assert "protected relay-preserving guard" in text
+        assert "codex mcp add time-library" not in text
+        assert "codex mcp remove time-library" not in text
         assert "front_door_port" in text or "front-door discovery" in text
         assert "--window-binding-registry" in text
         assert "--binding-key" in text
+        assert "--root" in text
         assert "codex" in text
         assert "MEMCORE_WINDOW_BINDING_REGISTRY" in text
         assert "chrome-native-hosts-v2.json" in text
         assert "chrome-native-hosts.json" in text
         assert "--url http://127.0.0.1:9851/mcp" not in text
         assert '--url "http://127.0.0.1:9851/mcp"' not in text
+
+
+def test_codex_mcp_guard_is_generic_and_failure_preserving_across_installers():
+    mac = (ROOT / "tools" / "macos_full_install.sh").read_text(encoding="utf-8")
+    linux = (ROOT / "tools" / "linux_full_install.sh").read_text(encoding="utf-8")
+    windows = (ROOT / "tools" / "windows_full_install.ps1").read_text(encoding="utf-8")
+
+    for text in (mac, linux, windows):
+        assert "codex_mcp_config_guard.py" in text
+        assert "--watch" in text
+        assert "--create-if-missing" in text
+        assert "existing host configuration and guard were left unchanged" in text
+        assert "codex mcp add time-library" not in text
+        assert "codex mcp remove time-library" not in text
+        assert "relay-preserving guard" in text
+
+    for text, marker in (
+        (mac, "install_codex_mcp_guard_launchagent()"),
+        (linux, "install_codex_mcp_guard_service()"),
+    ):
+        section = text.split(marker, 1)[1].split("\n}", 1)[0]
+        assert "CODEX_MCP_GUARD_STATUS" in section
+        assert '!= "installed"' in section
+        assert "guard unchanged" in section
+        assert "remove_codex_mcp_guard" not in section
+        assert "--watch" in section
+        assert "--create-if-missing" not in section
+
+    windows_autostart = windows.split("function Register-WindowsAutostart", 1)[1].split(
+        "function Run-Smoke", 1
+    )[0]
+    assert "Restore-PreviousCodexMcpGuardTask" in windows_autostart
+    assert 'if ($CodexMcpGuardStatus -eq "installed")' in windows_autostart
+    assert "Register-ScheduledTask -TaskName $snapshot.TaskName -Xml $snapshot.Xml" in windows
+    assert '$guardArgs = "`"$guardScript`" --watch' in windows_autostart
+    guard_args_line = next(
+        line for line in windows_autostart.splitlines() if "$guardArgs =" in line
+    )
+    assert "--create-if-missing" not in guard_args_line
+    main = windows.split('Info "Source: $SourceRoot"', 1)[1]
+    assert main.index("try { Install-CodexMcp }") < main.index("\n        Register-WindowsAutostart")
+
+
+def test_codex_catalog_points_to_guarded_merge_not_whole_file_cli_rewrite():
+    catalog = json.loads((ROOT / "config/platform_catalog.json").read_text(encoding="utf-8"))
+    storage = json.loads(
+        (ROOT / "config/platform_storage_patterns.verified.json").read_text(encoding="utf-8")
+    )
+    codex_catalog = next(item for item in catalog["entries"] if item["id"] == "codex")
+
+    assert "codex mcp add" not in codex_catalog["mcp"]["preferred_apply"]
+    assert "guard" in codex_catalog["mcp"]["preferred_apply"].lower()
+    preferred = storage["entries"]["codex"]["auto_connect"]["preferred_apply"]
+    assert "codex mcp add" not in preferred
+    assert "guard" in preferred.lower()
 
 
 def test_claude_code_mcp_is_migrated_from_fixed_http_to_stdio_discovery():
@@ -2583,6 +2779,20 @@ def test_windows_installer_preserves_runtime_state_files_on_mirror_update():
     assert '"update_history.jsonl"' in windows
 
 
+def test_installers_initialize_window_binding_registry_without_overwriting_existing_state():
+    mac = (ROOT / "tools" / "macos_full_install.sh").read_text(encoding="utf-8")
+    mac_write_config = mac.split("write_config() {", 1)[1].split("\n}", 1)[0]
+    assert 'if [[ ! -f "${INSTALL_ROOT}/config/window_binding_registry.json" && -f "${INSTALL_ROOT}/config/default_window_binding_registry.json" ]]; then' in mac_write_config
+
+    linux = (ROOT / "tools" / "linux_full_install.sh").read_text(encoding="utf-8")
+    linux_write_config = linux.split("write_config() {", 1)[1].split("\n}", 1)[0]
+    assert '[[ -f "${INSTALL_ROOT}/config/window_binding_registry.json" || ! -f "${INSTALL_ROOT}/config/default_window_binding_registry.json" ]] ||' in linux_write_config
+
+    windows = (ROOT / "tools" / "windows_full_install.ps1").read_text(encoding="utf-8")
+    write_config = windows.split("function Write-Config {", 1)[1].split("\n}", 1)[0]
+    assert 'Copy-ConfigTemplate -Name "default_window_binding_registry.json" -Target "window_binding_registry.json"' in write_config
+
+
 def test_windows_installer_passes_the_declared_argument_array_to_robocopy():
     windows = (ROOT / "tools" / "windows_full_install.ps1").read_text(encoding="utf-8")
     mirror_copy = windows.split("function Invoke-Robocopy {", 1)[1].split(
@@ -2634,6 +2844,9 @@ def test_windows_upgrade_is_transactional_and_no_start_rejects_a_live_root():
     rollback = windows.split("function Restore-InstallTransaction {", 1)[1].split(
         "function Remove-PreparedPythonAssets {", 1
     )[0]
+    remove_tree = windows.split("function Remove-Tree {", 1)[1].split(
+        "function Copy-ConfigTemplate {", 1
+    )[0]
 
     assert "Assert-NoStartTargetIsOffline" in main
     assert "Begin-InstallCutover" in main
@@ -2656,6 +2869,8 @@ def test_windows_upgrade_is_transactional_and_no_start_rejects_a_live_root():
     assert "Register-ScheduledTask -TaskName $snapshot.TaskName -Xml $snapshot.Xml" in windows
     assert "Get-CimInstance Win32_Process -ErrorAction Stop" in windows
     assert "Time Library processes are still running after stop request" in windows
+    assert "$maxAttempts = 20" in remove_tree
+    assert "Start-Sleep -Milliseconds 250" in remove_tree
     assert "-NoStart requires a new install root" in windows
     assert "-ResetInstall refuses to delete an existing root" in main
     assert "-ResetInstall target appeared after preflight" in windows

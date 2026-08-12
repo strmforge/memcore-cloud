@@ -2,6 +2,7 @@ import plistlib
 
 from tools.install_runtime_identity import (
     argv_targets_install_roots,
+    known_entrypoints,
     launchctl_targets_install_roots,
     macos_ps_command_targets_install_roots,
     plist_targets_install_roots,
@@ -88,6 +89,18 @@ def test_process_matching_rejects_editors_and_argument_lures(tmp_path):
     assert macos_ps_command_targets_install_roots(
         f"/usr/bin/python3 /tmp/checker.py --inspect {entrypoint}",
         [root],
+    ) is False
+
+
+def test_codex_mcp_guard_is_an_owned_runtime_entrypoint(tmp_path):
+    root = tmp_path / "Time Library"
+    guard = root / "tools/codex_mcp_config_guard.py"
+
+    assert guard in known_entrypoints([root])
+    assert guard in known_entrypoints(iter([root]))
+    assert argv_targets_install_roots(["/usr/bin/python3", str(guard), "--watch"], [root]) is True
+    assert argv_targets_install_roots(
+        ["/usr/bin/python3", "/tmp/checker.py", "--inspect", str(guard)], [root]
     ) is False
 
 

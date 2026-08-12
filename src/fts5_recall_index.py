@@ -7,13 +7,15 @@ source of truth and it is never allowed to mutate raw/archive records.
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Optional
 
 
 CONTRACT = "fts5_recall_index.v2026.7.3"
@@ -113,6 +115,13 @@ def corpus_signature(memories: Iterable[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def source_signature_digest(signature: Any) -> str:
+    if not signature:
+        return ""
+    payload = json.dumps(_jsonable(signature), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _connect(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.execute("PRAGMA journal_mode=WAL")
@@ -139,7 +148,13 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     )
 
 
-def build_index(memories: Iterable[dict[str, Any]], index_path: str, *, replace: bool = True) -> dict[str, Any]:
+def build_index(
+    memories: Iterable[dict[str, Any]],
+    index_path: str,
+    *,
+    replace: bool = True,
+    source_signature: str = "",
+) -> dict[str, Any]:
     capability = capability_probe()
     started = time.time()
     if not capability.get("ok"):
@@ -191,6 +206,8 @@ def build_index(memories: Iterable[dict[str, Any]], index_path: str, *, replace:
             "built_at": built_at,
             "sqlite_version": sqlite3.sqlite_version,
         }
+        if source_signature:
+            meta["source_signature"] = source_signature
         for key, value in meta.items():
             con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, str(value)))
         con.commit()
@@ -208,6 +225,182 @@ def build_index(memories: Iterable[dict[str, Any]], index_path: str, *, replace:
         }
     finally:
         con.close()
+
+
+def _cleanup_sqlite_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(path) + suffix)
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
+
+
+def _prepare_standalone_database(path: Path) -> dict[str, str]:
+    con = sqlite3.connect(str(path))
+    try:
+        quick_check = con.execute("PRAGMA quick_check").fetchone()
+        if not quick_check or str(quick_check[0]).lower() != "ok":
+            raise RuntimeError(f"sqlite_quick_check_failed:{quick_check}")
+        meta = _meta(con)
+        required_meta = {"contract", "corpus_signature", "doc_count", "built_at"}
+        if not required_meta.issubset(meta):
+            raise RuntimeError("index_metadata_incomplete")
+        checkpoint = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and int(checkpoint[0] or 0) != 0:
+            raise RuntimeError(f"wal_checkpoint_busy:{checkpoint}")
+        journal_mode = con.execute("PRAGMA journal_mode=DELETE").fetchone()
+        if not journal_mode or str(journal_mode[0]).lower() != "delete":
+            raise RuntimeError(f"journal_mode_not_standalone:{journal_mode}")
+        con.commit()
+        return meta
+    finally:
+        con.close()
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_with_retry(source: Path, target: Path, *, timeout_seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            retryable = isinstance(exc, PermissionError) or exc.errno in {errno.EACCES, errno.EBUSY, errno.EPERM}
+            if not retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def build_index_atomically(
+    memories: Iterable[dict[str, Any]],
+    index_path: str,
+    *,
+    expected_signature: str = "",
+    source_signature: str = "",
+    expected_source_signature: str = "",
+    source_signature_probe: Optional[Callable[[], str]] = None,
+) -> dict[str, Any]:
+    """Build a complete standalone database, then atomically publish it.
+
+    The live index remains readable while the candidate is built. Any build,
+    validation, or publish failure leaves the previous live index untouched.
+    """
+    started = time.time()
+    docs = [memory for memory in memories if isinstance(memory, dict)]
+    actual_signature = corpus_signature(docs)
+    target = Path(index_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if expected_signature and actual_signature != expected_signature:
+        return {
+            "ok": False,
+            "contract": CONTRACT,
+            "index_path": str(target),
+            "corpus_signature": actual_signature,
+            "expected_signature": expected_signature,
+            "error": "source_signature_changed_before_build",
+            "write_performed": False,
+            "atomic_publish": False,
+        }
+    if expected_source_signature and source_signature != expected_source_signature:
+        return {
+            "ok": False,
+            "contract": CONTRACT,
+            "index_path": str(target),
+            "corpus_signature": actual_signature,
+            "source_signature": source_signature,
+            "expected_source_signature": expected_source_signature,
+            "error": "source_snapshot_changed_before_build",
+            "write_performed": False,
+            "atomic_publish": False,
+        }
+
+    descriptor, candidate_name = tempfile.mkstemp(
+        prefix=f".{target.name}.build-",
+        suffix=".sqlite3",
+        dir=str(target.parent),
+    )
+    os.close(descriptor)
+    candidate = Path(candidate_name)
+    candidate.unlink()
+    published = False
+    try:
+        report = build_index(docs, str(candidate), source_signature=source_signature)
+        if not report.get("ok"):
+            report.update({
+                "index_path": str(target),
+                "write_performed": False,
+                "atomic_publish": False,
+            })
+            return report
+        meta = _prepare_standalone_database(candidate)
+        if meta.get("corpus_signature") != actual_signature:
+            raise RuntimeError("candidate_signature_mismatch")
+        if int(meta.get("doc_count") or -1) != len(docs):
+            raise RuntimeError("candidate_doc_count_mismatch")
+        if source_signature and meta.get("source_signature") != source_signature:
+            raise RuntimeError("candidate_source_signature_mismatch")
+        _cleanup_sqlite_sidecars(candidate)
+        _fsync_file(candidate)
+
+        live_wal = Path(str(target) + "-wal")
+        if live_wal.exists() and live_wal.stat().st_size:
+            raise RuntimeError("live_index_wal_not_checkpointed")
+        if source_signature_probe is not None:
+            current_source_signature = str(source_signature_probe() or "")
+            if source_signature and current_source_signature != source_signature:
+                raise RuntimeError("source_snapshot_changed_during_build")
+        _replace_with_retry(candidate, target)
+        published = True
+        _cleanup_sqlite_sidecars(target)
+        _fsync_directory(target.parent)
+        report.update({
+            "index_path": str(target),
+            "elapsed_seconds": round(time.time() - started, 4),
+            "write_performed": True,
+            "atomic_publish": True,
+            "error": None,
+        })
+        return report
+    except Exception as exc:
+        return {
+            "ok": False,
+            "contract": CONTRACT,
+            "index_path": str(target),
+            "doc_count": len(docs),
+            "corpus_signature": actual_signature,
+            "expected_signature": expected_signature,
+            "source_signature": source_signature,
+            "expected_source_signature": expected_source_signature,
+            "elapsed_seconds": round(time.time() - started, 4),
+            "error": f"{type(exc).__name__}: {exc}",
+            "write_performed": published,
+            "atomic_publish": published,
+        }
+    finally:
+        if not published:
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+            _cleanup_sqlite_sidecars(candidate)
 
 
 def _meta(con: sqlite3.Connection) -> dict[str, str]:
@@ -237,8 +430,25 @@ def _match_query(query: str) -> tuple[str, list[str]]:
     terms = _query_terms(query)
     if not terms:
         return "", []
-    quoted = ['"' + term.replace('"', '""') + '"' for term in terms[:8]]
-    return " OR ".join(quoted), terms
+    selected = [terms[0]]
+    for term in sorted(terms[1:], key=lambda item: (-len(item), item)):
+        if term in selected:
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", term) and len(term) < 5:
+            continue
+        selected.append(term)
+        if len(selected) >= 4:
+            break
+    quoted = ['"' + term.replace('"', '""') + '"' for term in selected]
+    return " OR ".join(quoted), selected
+
+
+def _query_timeout_seconds() -> float:
+    try:
+        configured = float(os.environ.get("MEMCORE_FTS5_QUERY_TIMEOUT_SECONDS") or "1.0")
+    except (TypeError, ValueError):
+        configured = 1.0
+    return max(0.05, min(configured, 5.0))
 
 
 def search_index(
@@ -247,6 +457,7 @@ def search_index(
     index_path: str,
     limit: int = 20,
     expected_signature: str = "",
+    expected_source_signature: str = "",
 ) -> dict[str, Any]:
     started = time.time()
     match_query, terms = _match_query(query)
@@ -269,12 +480,15 @@ def search_index(
     if not os.path.exists(index_path):
         status.update({"error": "index_missing"})
         return {"ok": False, "rows": [], "status": status}
+    con = None
+    query_timeout = _query_timeout_seconds()
     try:
         con = sqlite3.connect(index_path)
+        deadline = time.monotonic() + query_timeout
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         meta = _meta(con)
         required_meta = {"contract", "corpus_signature", "doc_count", "built_at"}
         if not required_meta.issubset(meta):
-            con.close()
             status.update({
                 "error": "index_not_ready",
                 "build_in_progress": True,
@@ -282,7 +496,39 @@ def search_index(
             })
             return {"ok": False, "rows": [], "status": status}
         actual_signature = meta.get("corpus_signature", "")
-        stale = bool(expected_signature and actual_signature and actual_signature != expected_signature)
+        actual_source_signature = meta.get("source_signature", "")
+        corpus_stale = bool(expected_signature and actual_signature and actual_signature != expected_signature)
+        source_stale = bool(
+            expected_source_signature
+            and actual_source_signature != expected_source_signature
+        )
+        stale = corpus_stale or source_stale
+        stale_reason = ""
+        if corpus_stale:
+            stale_reason = "corpus_signature_mismatch"
+        elif source_stale and not actual_source_signature:
+            stale_reason = "source_signature_missing"
+        elif source_stale:
+            stale_reason = "source_signature_mismatch"
+        status.update({
+            "doc_count": int(meta.get("doc_count") or 0),
+            "corpus_signature": actual_signature,
+            "expected_signature": expected_signature,
+            "source_signature": actual_source_signature,
+            "expected_source_signature": expected_source_signature,
+            "built_at": meta.get("built_at", ""),
+            "stale": stale,
+            "stale_reason": stale_reason,
+            "query_timeout_seconds": query_timeout,
+        })
+        if stale:
+            status.update({
+                "error": "stale_index",
+                "fallback_required": True,
+                "stale_index_skipped": True,
+                "elapsed_seconds": round(time.time() - started, 4),
+            })
+            return {"ok": False, "rows": [], "status": status}
         rows = [
             {
                 "doc_id": str(row[0]),
@@ -298,26 +544,32 @@ def search_index(
                 (match_query, int(limit)),
             ).fetchall()
         ]
-        con.close()
         status.update({
             "applied": bool(rows),
             "matched_count": len(rows),
             "raw_matched_count": len(rows),
-            "doc_count": int(meta.get("doc_count") or 0),
-            "corpus_signature": actual_signature,
-            "expected_signature": expected_signature,
-            "built_at": meta.get("built_at", ""),
-            "stale": stale,
             "elapsed_seconds": round(time.time() - started, 4),
             "rank_reason": "sqlite_fts5_trigram_bm25",
         })
         return {"ok": True, "rows": rows, "status": status}
+    except sqlite3.OperationalError as exc:
+        interrupted = "interrupted" in str(exc).lower()
+        status.update({
+            "error": "query_timeout" if interrupted else f"OperationalError: {exc}",
+            "elapsed_seconds": round(time.time() - started, 4),
+            "fallback_required": interrupted,
+            "query_timeout_seconds": query_timeout,
+        })
+        return {"ok": False, "rows": [], "status": status}
     except Exception as exc:
         status.update({
             "error": f"{type(exc).__name__}: {exc}",
             "elapsed_seconds": round(time.time() - started, 4),
         })
         return {"ok": False, "rows": [], "status": status}
+    finally:
+        if con is not None:
+            con.close()
 
 
 def _memory_to_legacy_doc(memory: dict[str, Any]) -> dict[str, Any]:
@@ -423,6 +675,7 @@ def fts5_status():
             "built": True,
             "doc_count": int(meta.get("doc_count") or 0),
             "corpus_signature": meta.get("corpus_signature", ""),
+            "source_signature": meta.get("source_signature", ""),
             "built_at": meta.get("built_at", ""),
             "contract": meta.get("contract", CONTRACT),
         })

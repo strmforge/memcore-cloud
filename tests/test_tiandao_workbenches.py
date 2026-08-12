@@ -46,6 +46,7 @@ def test_tiandao_workbenches_dashboard_aggregates_without_writes(monkeypatch):
             "record_count": 7,
             "record_guarded_count": 6,
             "raw_not_current_count": 1,
+            "raw_divergence_generation_active_count": 2,
             "lost_source_count": 0,
             "lost_raw_count": 1,
             "backfill_recommended_count": 1,
@@ -139,6 +140,7 @@ def test_tiandao_workbenches_dashboard_aggregates_without_writes(monkeypatch):
     ]
     origin = result["workbenches"][0]
     assert origin["summary"]["millisecond_level_source_count"] == 5
+    assert origin["summary"]["raw_divergence_generation_active_count"] == 2
     assert origin["summary"]["time_twin_star_runtime_status"] == "source_runtime_route_present"
     assert origin["summary"]["time_twin_star_installed_runtime_status"] == "proven"
     assert origin["summary"]["time_twin_star_source_proven_count"] == 11

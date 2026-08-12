@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import sys
 import threading
 import urllib.error
@@ -40,6 +41,44 @@ def test_console_i18n_keeps_zh_cn_labels_chinese(tmp_path, monkeypatch):
     assert zh["nav.update"] == "系统更新"
     assert zh["nav.sourceSystems"] == "数据源"
     assert zh["runtime.refresh"] == "刷新"
+
+
+def test_p6_pid_file_owner_cleanup(tmp_path, monkeypatch):
+    p6 = _reload_p6(tmp_path, monkeypatch)
+    pid_path = tmp_path / "runtime" / "p6-console.pid"
+    monkeypatch.setattr(p6, "P6_PID_PATH", pid_path)
+
+    assert p6._write_p6_pid_file() is True
+
+    assert pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
+    p6._clear_p6_pid_file()
+    assert not pid_path.exists()
+
+
+def test_p6_pid_write_failure_does_not_become_service_failure(tmp_path, monkeypatch):
+    p6 = _reload_p6(tmp_path, monkeypatch)
+    pid_path = tmp_path / "runtime" / "p6-console.pid"
+    monkeypatch.setattr(p6, "P6_PID_PATH", pid_path)
+    monkeypatch.setattr(
+        p6._console_runtime_profile.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("read-only runtime")),
+    )
+
+    assert p6._write_p6_pid_file() is False
+    assert not pid_path.exists()
+
+
+def test_p6_pid_cleanup_preserves_new_process_owner(tmp_path, monkeypatch):
+    p6 = _reload_p6(tmp_path, monkeypatch)
+    pid_path = tmp_path / "runtime" / "p6-console.pid"
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("999999\n", encoding="ascii")
+    monkeypatch.setattr(p6, "P6_PID_PATH", pid_path)
+
+    p6._clear_p6_pid_file()
+
+    assert pid_path.read_text(encoding="ascii") == "999999\n"
 
 
 def test_console_user_visible_text_has_no_internal_phase_codes(tmp_path, monkeypatch):
@@ -137,6 +176,19 @@ def test_product_console_explains_preference_and_work_experience_in_both_languag
     assert "archive-layout/audit" in html
     assert "理解某人的偏好" not in html
     assert "understanding a person" not in html
+
+
+def test_product_console_final_canvas_pass_keeps_responsive_tracks_shrinkable():
+    html = (ROOT / "web" / "console_product.html").read_text(encoding="utf-8")
+    final_css = html.split("/* Canvas visual pass 5.1:", 1)[1].split("</style>", 1)[0]
+
+    assert "grid-template-columns: minmax(0, 0.88fr) minmax(0, 0.86fr) minmax(0, 0.94fr);" in final_css
+    assert "@media (max-width: 1499px)" in final_css
+    assert '"report insight"' in final_css
+    assert "@media (min-width: 1181px) and (max-width: 1380px)" in final_css
+    mobile_css = final_css.split("@media (max-width: 1180px)", 1)[1]
+    assert "grid-template-columns: minmax(0, 1fr);" in mobile_css
+    assert "grid-template-areas: none;" in mobile_css
 
 
 def test_product_console_overview_shows_detected_local_ai_tools_only():
@@ -322,8 +374,12 @@ def test_product_console_home_health_includes_guardian_and_never_renders_message
     assert "local services are running normally" not in html
     assert "text === 'bad'" in html
     assert "text === 'warn'" in html
+    assert "function lostSourceTriage(summary)" in html
     assert "function guardianIsOk(guardian)" in html
     assert "Number(summary.lost_raw_count || 0) === 0" in html
+    assert "triage.unrecoverable === 0" in html
+    guardian_check = html.split("function guardianIsOk(guardian)", 1)[1].split("function guardianSummaryText", 1)[0]
+    assert "lost_source_count || 0) === 0" not in guardian_check
     assert "function rawMessageCountText(raw)" in html
     health_rows = html.split("function productHealthRows(health, guardian, raw, zhiyi)", 1)[1].split("async function loadZhiyi", 1)[0]
     assert "const documentCount = rawMessageCountText(raw)" in health_rows
@@ -591,6 +647,13 @@ def test_product_console_surfaces_record_guardian_without_auto_write():
     assert "raw_lagging_or_missing_count" in html
     assert "origin_event_count" in html
     assert "lost_source_count" in html
+    assert "lost_source_recoverable_count" in html
+    assert "lost_source_unrecoverable_count" in html
+    assert "lost_source_not_measured_count" in html
+    assert "record.actionRetainedRaw" in html
+    assert "record.actionMeasureRecoverability" in html
+    assert "item.recoverable_from_raw === true" in html
+    assert "supported && (item.backfill_recommended || issueKind === 'lost_raw')" in html
     assert "lost_raw_count" in html
     assert "时间起源" in html
     assert "遗失源" in html
@@ -614,8 +677,8 @@ def test_product_console_surfaces_record_guardian_without_auto_write():
     assert "without triggering backfill" in html
     assert "raw 可回源" in html
     assert "Raw available" in html
-    assert "遗失明细" in html
-    assert "Lost detail" in html
+    assert "记录证据明细" in html
+    assert "Record evidence detail" in html
     assert "record-lost-details" in html
     assert "renderRecordIssueDetails" in html
     assert "recordIssueKind" in html

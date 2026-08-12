@@ -310,7 +310,31 @@ def origin_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         item for item in records
         if isinstance(item, dict)
         and item.get("origin_status") == ORIGIN_STATUS_LOST_SOURCE
-        and item.get("recoverable_from_raw")
+        and item.get("recoverable_from_raw") is True
+    ]
+    unrecoverable_origin = [
+        item for item in records
+        if isinstance(item, dict)
+        and item.get("origin_status") == ORIGIN_STATUS_LOST_SOURCE
+        and item.get("recoverable_from_raw") is False
+    ]
+    not_measured_origin = [
+        item for item in records
+        if isinstance(item, dict)
+        and item.get("origin_status") == ORIGIN_STATUS_LOST_SOURCE
+        and item.get("recoverable_from_raw") is None
+    ]
+    one_sided_origin = [
+        item for item in records
+        if isinstance(item, dict)
+        and item.get("origin_status") == ORIGIN_STATUS_LOST_SOURCE
+        and item.get("recoverability_class") == "conversation_one_sided"
+    ]
+    non_conversation_origin = [
+        item for item in records
+        if isinstance(item, dict)
+        and item.get("origin_status") == ORIGIN_STATUS_LOST_SOURCE
+        and item.get("recoverability_class") == "non_conversation_structurally_valid"
     ]
     first_by_runtime = first_witnessed_raw_by_local_runtime(records)
     return {
@@ -327,6 +351,13 @@ def origin_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "raw_without_source_count": len(raw_without_source),
         "origin_unavailable_count": len(unavailable),
         "recoverable_origin_count": len(recoverable_origin),
+        "unrecoverable_origin_count": len(unrecoverable_origin),
+        "not_measured_origin_count": len(not_measured_origin),
+        "lost_source_recoverable_count": len(recoverable_origin),
+        "lost_source_unrecoverable_count": len(unrecoverable_origin),
+        "lost_source_not_measured_count": len(not_measured_origin),
+        "lost_source_one_sided_count": len(one_sided_origin),
+        "lost_source_non_conversation_count": len(non_conversation_origin),
         "max_origin_lag_milliseconds": max_lag_ms,
         "local_runtime_policy": "each_runtime_has_first_witnessed_raw_event",
         "local_runtime_first_witnessed_raw_count": len(first_by_runtime),

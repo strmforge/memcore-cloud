@@ -3,6 +3,9 @@ param(
     [string]$InstallRoot = "$env:LOCALAPPDATA\time-library",
     [string]$RawGatewayUrl = "",
     [switch]$SkipCodex,
+    [switch]$SkipScheduledTaskChecks,
+    [switch]$SkipCodexGuardTaskCheck,
+    [switch]$RequireBackgroundRecoveryAfterBoot,
     [switch]$Json
 )
 
@@ -22,6 +25,10 @@ $Report = [ordered]@{
     install_root = $InstallRoot
     raw_gateway_url = $RawGatewayUrl
     ok = $false
+    measurement_status = "complete"
+    full_smoke = $true
+    background_recovery_after_boot_required = [bool]$RequireBackgroundRecoveryAfterBoot
+    not_measured_layers = @()
     checks = @()
 }
 
@@ -42,6 +49,27 @@ function Add-Check {
     if (-not $Json) {
         $mark = if ($Ok) { "ok" } else { "fail" }
         Write-Host ("[{0}] {1} {2}" -f $mark, $Name, $Detail)
+    }
+}
+
+function Add-NotMeasuredCheck {
+    param(
+        [string]$Name,
+        [string]$Detail
+    )
+    $script:Report.measurement_status = "partial"
+    $script:Report.full_smoke = $false
+    if ($Name -notin @($script:Report.not_measured_layers)) {
+        $script:Report.not_measured_layers += $Name
+    }
+    $script:Report.checks += [ordered]@{
+        name = $Name
+        ok = $null
+        measurement_status = "not_measured"
+        detail = $Detail
+    }
+    if (-not $Json) {
+        Write-Host ("[not_measured] {0} {1}" -f $Name, $Detail)
     }
 }
 
@@ -644,8 +672,8 @@ function Test-CodexProviderBucket {
         $base -eq "http://127.0.0.1:15721/v1" -or
         $base -eq "http://localhost:15721/v1"
     )
-    if ($usesLocalRelayProxy -and ([string]$config.model_provider).ToLowerInvariant() -ne "token") {
-        Fail-Smoke -Name "codex_provider_bucket_drift" -Detail "127.0.0.1:15721 local relay route expects model_provider=token; provider bucket drift breaks Codex even when the relay is healthy"
+    if ($usesLocalRelayProxy) {
+        Add-Check -Name "codex_provider_route_binding" -Ok $true -Detail ("selected [" + [string]$config.provider_section + "] owns the local relay route; provider bucket names are host-defined")
     }
 
     $modelsStatus = $null
@@ -680,6 +708,7 @@ function Test-CodexProviderBucket {
         model = [string]$config.model
         model_provider = [string]$config.model_provider
         provider_bucket_matches_section = [bool]$config.provider_section_exists
+        provider_bucket_name_is_route_identity = $false
         base_url = [string]$config.base_url
         wire_api = [string]$config.wire_api
         local_relay_route = [bool]$usesLocalRelayProxy
@@ -750,7 +779,10 @@ function Test-P0Watcher {
 function Test-ScheduledTaskPresent {
     param(
         [string]$Name,
-        [bool]$Required = $true
+        [bool]$Required = $true,
+        [string]$ExpectedLogonType = "",
+        [switch]$RequireRecentSuccessfulRun,
+        [switch]$RequireRunAfterBoot
     )
     $task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
     if (-not $task) {
@@ -760,9 +792,20 @@ function Test-ScheduledTaskPresent {
         Add-Check -Name ("scheduled_task_" + $Name) -Ok $false -Detail "missing"
         return
     }
-    $ok = $task.State -ne "Disabled"
+    $settingsEnabled = ($null -ne $task.Settings) -and [bool]$task.Settings.Enabled
+    $ok = ($task.State -ne "Disabled") -and $settingsEnabled
     if (-not $ok -and $Required) {
-        Fail-Smoke -Name ("scheduled_task_" + $Name) -Detail ("disabled state=" + [string]$task.State)
+        Fail-Smoke `
+            -Name ("scheduled_task_" + $Name) `
+            -Detail ("disabled state=" + [string]$task.State + "; settings_enabled=" + [string]$settingsEnabled)
+    }
+    if (
+        (-not [string]::IsNullOrWhiteSpace($ExpectedLogonType)) -and
+        ([string]$task.Principal.LogonType -ne $ExpectedLogonType)
+    ) {
+        Fail-Smoke `
+            -Name ("scheduled_task_" + $Name) `
+            -Detail ("expected principal_logon_type=" + $ExpectedLogonType + "; actual=" + [string]$task.Principal.LogonType)
     }
     $actionArgs = (@($task.Actions | ForEach-Object { [string]$_.Arguments }) -join " ")
     $actionExe = (@($task.Actions | ForEach-Object { [string]$_.Execute }) -join " ")
@@ -777,7 +820,108 @@ function Test-ScheduledTaskPresent {
     if (($Name -eq "MemcoreCloudTray") -and ($actionArgs -notmatch "-WindowStyle\s+Hidden")) {
         Fail-Smoke -Name ("scheduled_task_" + $Name) -Detail "tray task action is not hidden; a console window may flash"
     }
-    Add-Check -Name ("scheduled_task_" + $Name) -Ok $ok -Detail ("state=" + [string]$task.State)
+    $runDetail = ""
+    if ($RequireRecentSuccessfulRun -or $RequireRunAfterBoot) {
+        $info = Get-ScheduledTaskInfo -TaskName $Name -ErrorAction Stop
+        $lastRun = [datetime]$info.LastRunTime
+        $lastResult = [uint32]$info.LastTaskResult
+        $running = ([string]$task.State -eq "Running")
+        if ($RequireRecentSuccessfulRun) {
+            $recent = ($lastRun -gt (Get-Date).AddMinutes(-20))
+            if ((-not $recent) -or ((-not $running) -and ($lastResult -ne 0))) {
+                Fail-Smoke `
+                    -Name ("scheduled_task_" + $Name) `
+                    -Detail ("background task has no recent successful execution; state=" + [string]$task.State + "; last_run=" + $lastRun.ToString("o") + "; last_result=" + ("{0} (0x{1:X8})" -f [uint64]$lastResult, [uint64]$lastResult) + "; inspect SeBatchLogonRight/SeDenyBatchLogonRight and TaskScheduler Operational events")
+            }
+            $runDetail += "; recent_20m=" + [string]$recent
+        }
+        if ($RequireRunAfterBoot) {
+            $lastBoot = [datetime](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+            $postBoot = ($lastRun -gt $lastBoot)
+            if (-not $postBoot) {
+                Fail-Smoke `
+                    -Name ("scheduled_task_" + $Name) `
+                    -Detail ("background task has not run after this boot; last_run=" + $lastRun.ToString("o") + "; last_boot=" + $lastBoot.ToString("o"))
+            }
+            $runDetail += "; last_boot=" + $lastBoot.ToString("o") + "; post_boot=" + [string]$postBoot
+        }
+        $runDetail = "; last_run=" + $lastRun.ToString("o") + "; last_result=" + ("{0} (0x{1:X8})" -f [uint64]$lastResult, [uint64]$lastResult) + $runDetail
+    }
+    Add-Check `
+        -Name ("scheduled_task_" + $Name) `
+        -Ok $ok `
+        -Detail ("state=" + [string]$task.State + "; settings_enabled=" + [string]$settingsEnabled + "; principal_logon_type=" + [string]$task.Principal.LogonType + $runDetail)
+}
+
+function Merge-WindowsGuardianCoverage {
+    param(
+        [object]$Payload,
+        [string]$Source
+    )
+    if ($null -eq $Payload) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source payload is missing"
+    }
+    $fields = @($Payload.PSObject.Properties.Name)
+    foreach ($field in @("ok", "measurement_status", "full_health_check", "not_measured_layers", "generated_at")) {
+        if ($field -notin $fields) {
+            Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source payload is missing $field"
+        }
+    }
+    if ($Payload.ok -isnot [bool]) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source ok must be boolean"
+    }
+    if ($Payload.measurement_status -isnot [string]) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source measurement_status must be a string"
+    }
+    if ($Payload.full_health_check -isnot [bool]) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source full_health_check must be boolean"
+    }
+    if ($Payload.not_measured_layers -isnot [System.Array]) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source not_measured_layers must be an array"
+    }
+    if (
+        ($Payload.generated_at -isnot [string]) -or
+        [string]::IsNullOrWhiteSpace([string]$Payload.generated_at)
+    ) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source generated_at must be a non-empty string"
+    }
+    try {
+        [void]([datetime]$Payload.generated_at)
+    } catch {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source generated_at is invalid"
+    }
+    $measurementStatus = [string]$Payload.measurement_status
+    $notMeasuredLayers = @($Payload.not_measured_layers)
+    if ($measurementStatus -notin @("complete", "partial")) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source measurement_status must be complete or partial"
+    }
+    if (@($notMeasuredLayers | Where-Object { ($_ -isnot [string]) -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source not_measured_layers must contain non-empty strings"
+    }
+    if (
+        ($measurementStatus -eq "complete") -and
+        ((-not [bool]$Payload.full_health_check) -or ($notMeasuredLayers.Count -ne 0))
+    ) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source complete coverage is inconsistent"
+    }
+    if (
+        ($measurementStatus -eq "partial") -and
+        ([bool]$Payload.full_health_check -or ($notMeasuredLayers.Count -eq 0))
+    ) {
+        Fail-Smoke -Name "windows_guardian_coverage" -Detail "$Source partial coverage is inconsistent"
+    }
+    if (-not [bool]$Payload.ok) {
+        Fail-Smoke -Name "windows_guardian_run" -Detail "$Source Guardian payload reported ok=false"
+    }
+    foreach ($layer in $notMeasuredLayers) {
+        $name = "windows_guardian:" + [string]$layer
+        if ($name -notin @($script:Report.not_measured_layers)) {
+            Add-NotMeasuredCheck `
+                -Name $name `
+                -Detail ("nested Guardian coverage is partial: " + [string]$layer)
+        }
+    }
+    return $measurementStatus
 }
 
 function Test-GuardianAndTray {
@@ -789,9 +933,29 @@ function Test-GuardianAndTray {
     Test-PathRequired -Name "windows_hidden_guardian_launcher" -Path $hiddenGuardian
     Test-PathRequired -Name "windows_tray_script" -Path $tray
 
-    Test-ScheduledTaskPresent -Name "MemcoreCloudGuardianLogon"
-    Test-ScheduledTaskPresent -Name "MemcoreCloudGuardianHealth"
-    Test-ScheduledTaskPresent -Name "MemcoreCloudTray" -Required:$false
+    if ($SkipScheduledTaskChecks) {
+        Add-NotMeasuredCheck `
+            -Name "scheduled_tasks" `
+            -Detail "explicit -NoAutostart preservation path; scheduled-task contract not measured and background recovery not inferred"
+    } else {
+        Test-ScheduledTaskPresent -Name "MemcoreCloudGuardianLogon" -ExpectedLogonType "Interactive"
+        Test-ScheduledTaskPresent `
+            -Name "MemcoreCloudGuardianHealth" `
+            -ExpectedLogonType "S4U" `
+            -RequireRecentSuccessfulRun `
+            -RequireRunAfterBoot:$RequireBackgroundRecoveryAfterBoot
+        if ($SkipCodexGuardTaskCheck) {
+            Add-NotMeasuredCheck `
+                -Name "scheduled_task_MemcoreCloudCodexMcpGuard" `
+                -Detail "explicit preserved-guard path; principal not measured"
+        } else {
+            Test-ScheduledTaskPresent `
+                -Name "MemcoreCloudCodexMcpGuard" `
+                -ExpectedLogonType "S4U" `
+                -RequireRunAfterBoot:$RequireBackgroundRecoveryAfterBoot
+        }
+        Test-ScheduledTaskPresent -Name "MemcoreCloudTray" -ExpectedLogonType "Interactive" -Required:$false
+    }
 
     $powershellExe = Join-Path $PSHOME "powershell.exe"
     $guardianArgs = @(
@@ -803,6 +967,16 @@ function Test-GuardianAndTray {
     } else {
         $guardianArgs += "-Backfill"
     }
+    if ($SkipScheduledTaskChecks) {
+        $guardianArgs += "-SkipScheduledTaskChecks"
+    }
+    if ($SkipCodexGuardTaskCheck) {
+        $guardianArgs += "-SkipCodexMcpGuardTaskCheck"
+    }
+    if ($RequireBackgroundRecoveryAfterBoot) {
+        $guardianArgs += "-RequireBackgroundRecoveryAfterBoot"
+    }
+    $guardianInvocationStarted = (Get-Date).ToUniversalTime()
     $output = & $powershellExe @guardianArgs 2>&1
     $exitCode = $LASTEXITCODE
     $text = ($output | Out-String)
@@ -814,15 +988,48 @@ function Test-GuardianAndTray {
     } catch {
         Fail-Smoke -Name "windows_guardian_run" -Detail "guardian returned non-JSON"
     }
-    if (-not $payload.ok) {
-        Fail-Smoke -Name "windows_guardian_run" -Detail $text.Trim()
+    $payloadCoverage = Merge-WindowsGuardianCoverage -Payload $payload -Source "process_output"
+    $payloadFields = @($payload.PSObject.Properties.Name)
+    if (("skipped" -in $payloadFields) -and [bool]$payload.skipped) {
+        if ([string]$payload.reason -ne "guardian_already_running") {
+            Fail-Smoke -Name "windows_guardian_run" -Detail ("unexpected Guardian skip reason: " + [string]$payload.reason)
+        }
+        if ($payloadCoverage -ne "partial") {
+            Fail-Smoke -Name "windows_guardian_coverage" -Detail "concurrent Guardian skip must be partial"
+        }
+        return
     }
     $statusPath = Join-Path $InstallRoot "runtime\guardian-status.json"
-    Test-PathRequired -Name "windows_guardian_status" -Path $statusPath
-    try {
-        $statusPayload = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-        Fail-Smoke -Name "guardian_status_content" -Detail "guardian-status.json is not valid JSON"
+    if ($SkipCodex) {
+        $statusPayload = $payload
+    } else {
+        Test-PathRequired -Name "windows_guardian_status" -Path $statusPath
+        try {
+            $statusPayload = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            Fail-Smoke -Name "guardian_status_content" -Detail "guardian-status.json is not valid JSON"
+        }
+        try {
+            $statusWriteTime = (Get-Item -LiteralPath $statusPath -ErrorAction Stop).LastWriteTimeUtc
+        } catch {
+            Fail-Smoke -Name "guardian_status_content" -Detail "guardian-status.json metadata is unavailable"
+        }
+        $statusCoverage = Merge-WindowsGuardianCoverage -Payload $statusPayload -Source "status_file"
+        try {
+            $statusGeneratedAt = ([datetime]$statusPayload.generated_at).ToUniversalTime()
+        } catch {
+            Fail-Smoke -Name "guardian_status_content" -Detail "guardian-status.json generated_at is invalid"
+        }
+        if ($statusGeneratedAt -lt $guardianInvocationStarted.AddSeconds(-1)) {
+            Fail-Smoke `
+                -Name "guardian_status_content" `
+                -Detail ("guardian-status.json is stale for this invocation; generated_at=" + $statusGeneratedAt.ToString("o") + "; invocation_started=" + $guardianInvocationStarted.ToString("o"))
+        }
+        if ($statusWriteTime -lt $guardianInvocationStarted) {
+            Fail-Smoke `
+                -Name "guardian_status_content" `
+                -Detail ("guardian-status.json was not written by this invocation; last_write=" + $statusWriteTime.ToString("o") + "; invocation_started=" + $guardianInvocationStarted.ToString("o"))
+        }
     }
     if ($SkipCodex) {
         try {
@@ -834,15 +1041,41 @@ function Test-GuardianAndTray {
             Fail-Smoke -Name "guardian_record_attention" -Detail ("record Guardian query failed: " + $_.Exception.Message)
         }
         $summary = $recordStatus.summary
+        $lostSourceCount = [int]$summary.lost_source_count
+        $triageFields = @(
+            "lost_source_recoverable_count",
+            "lost_source_unrecoverable_count",
+            "lost_source_not_measured_count"
+        )
+        $summaryFields = @($summary.PSObject.Properties.Name)
+        $hasCompleteTriage = @($triageFields | Where-Object { $_ -in $summaryFields }).Count -eq $triageFields.Count
+        $lostSourceRecoverable = [int]$summary.lost_source_recoverable_count
+        $lostSourceUnrecoverable = [int]$summary.lost_source_unrecoverable_count
+        $lostSourceNotMeasured = [int]$summary.lost_source_not_measured_count
+        $lostSourceOneSided = [int]$summary.lost_source_one_sided_count
+        $lostSourceNonConversation = [int]$summary.lost_source_non_conversation_count
+        if ((-not $hasCompleteTriage) -or (($lostSourceRecoverable + $lostSourceUnrecoverable + $lostSourceNotMeasured) -ne $lostSourceCount)) {
+            $lostSourceUnrecoverable = $lostSourceCount
+        }
+        if (($lostSourceOneSided + $lostSourceNonConversation) -gt $lostSourceRecoverable) {
+            Fail-Smoke -Name "guardian_recoverability_subtypes" -Detail "recoverable subtype counts exceed lost_source_recoverable_count"
+        }
+        if ($null -eq $recordStatus.summary_scope) {
+            Fail-Smoke -Name "guardian_summary_scope" -Detail "summary scope evidence is missing"
+        } elseif ($recordStatus.summary_scope.summary_is_sample) {
+            Add-Check -Name "guardian_summary_scope" -Ok $true -Detail "bounded population sample; trend comparison must use scope key"
+        } else {
+            Add-Check -Name "guardian_summary_scope" -Ok $true -Detail "population complete"
+        }
         $attention = [int]$summary.raw_attention_count +
-            [int]$summary.lost_source_count +
+            $lostSourceUnrecoverable +
             [int]$summary.lost_raw_count +
             [int]$summary.corrupt_record_count
         if ($attention -gt 0) {
             $detail = (
-                "record attention preserved; raw_attention={0} lost_source={1} lost_raw={2} corrupt={3}" -f
+                "record attention preserved; raw_attention={0} lost_source_unrecoverable={1} lost_raw={2} corrupt={3}" -f
                 [int]$summary.raw_attention_count,
-                [int]$summary.lost_source_count,
+                $lostSourceUnrecoverable,
                 [int]$summary.lost_raw_count,
                 [int]$summary.corrupt_record_count
             )
@@ -857,7 +1090,12 @@ function Test-GuardianAndTray {
     } else {
         Add-Check -Name "guardian_status_content" -Ok $true -Detail "ok"
     }
-    Add-Check -Name "windows_guardian_run" -Ok $true -Detail "ok"
+    $guardianDetail = if ($script:Report.measurement_status -eq "partial") {
+        "measured checks passed; nested Guardian coverage is partial"
+    } else {
+        "ok"
+    }
+    Add-Check -Name "windows_guardian_run" -Ok $true -Detail $guardianDetail
 }
 
 function Test-CodexCaptureStatus {
@@ -879,17 +1117,39 @@ function Test-CodexCaptureStatus {
     $payload = $null
     $lastText = ""
     $lastExitCode = 0
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
+    $captureStatusMaxAttempts = 8
+    $captureStatusPollMilliseconds = 5000
+    for ($attempt = 1; $attempt -le $captureStatusMaxAttempts; $attempt++) {
+        $payload = $null
         $output = & $python $connector --status 2>&1
         $lastExitCode = $LASTEXITCODE
         $lastText = ($output | Out-String)
         if ($lastExitCode -eq 0) {
             try {
                 $payload = ConvertFrom-JsonOutput -Text $lastText
-                break
             } catch { }
         }
-        Start-Sleep -Milliseconds 750
+        if ($payload) {
+            $candidateRawSync = $payload.raw_sync
+            $candidateStatus = if ($candidateRawSync -and $candidateRawSync.status) {
+                [string]$candidateRawSync.status
+            } else {
+                ""
+            }
+            if (($candidateStatus -notin @("raw_missing", "raw_lagging_sla_breach")) -or ($attempt -eq $captureStatusMaxAttempts)) {
+                break
+            }
+            $reportedInterval = 0
+            try { $reportedInterval = [int]$payload.poll_interval_milliseconds } catch { }
+            if ($reportedInterval -gt 0) {
+                $captureStatusPollMilliseconds = [Math]::Max(1000, [Math]::Min(5000, $reportedInterval))
+            }
+            Start-Sleep -Milliseconds $captureStatusPollMilliseconds
+            continue
+        }
+        if ($attempt -lt $captureStatusMaxAttempts) {
+            Start-Sleep -Milliseconds 750
+        }
     }
     if ($lastExitCode -ne 0) {
         Fail-Smoke -Name "codex_capture_status" -Detail ("codex connector status failed: " + $lastText.Trim())
@@ -910,7 +1170,16 @@ function Test-CodexCaptureStatus {
         Fail-Smoke -Name "codex_capture_status" -Detail "missing raw_sync status"
     }
     if ($rawSync.status -in @("raw_missing", "raw_lagging_sla_breach")) {
-        Fail-Smoke -Name "codex_capture_status" -Detail ("Codex source records are ahead of Time Library raw; missing/stale=" + [string]$rawSync.missing_or_stale_count)
+        $detail = (
+            "Codex source records remain ahead after {0} bounded checks; status={1} missing/stale={2} lag_bytes={3} lag_ms={4} sla_breaches={5}" -f
+            $captureStatusMaxAttempts,
+            [string]$rawSync.status,
+            [string]$rawSync.missing_or_stale_count,
+            [string]$rawSync.raw_archive_total_lag_bytes,
+            [string]$rawSync.raw_archive_max_lag_milliseconds,
+            [string]$rawSync.raw_lag_sla_breach_count
+        )
+        Fail-Smoke -Name "codex_capture_status" -Detail $detail
     }
     if ($rawSync.status -eq "source_unreachable") {
         Fail-Smoke -Name "codex_capture_status" -Detail "Codex source records are unreachable"

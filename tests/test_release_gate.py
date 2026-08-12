@@ -48,6 +48,8 @@ def test_release_gate_uses_clean_head_archive_by_default():
     assert "assert_runtime_version_uses_version_file" in text
     assert "PERSONAL_IDENTITY_TERMS" in text
     assert "assert_no_personal_identity_terms" in text
+    assert "LOB_CREDENTIAL_SHAPE" in text
+    assert "assert_no_lob_credential_shapes" in text
     assert tuple(gate.PRIVATE_TOP_LEVEL_FILES) == (
         "AGENTS.md",
         "CODEX_CONTINUITY_LEDGER.md",
@@ -186,6 +188,57 @@ def test_release_gate_default_pytest_node_ids_exist():
         assert node_id in functions, arg
 
 
+def test_local_connectors_explicitly_enable_divergence_generations_on_ingest_paths():
+    def call_name(call):
+        func = call.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return ""
+
+    def catches_oserror(handler):
+        names = set()
+        for node in ast.walk(handler.type) if handler.type is not None else ():
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+        return "OSError" in names
+
+    connector_paths = sorted((ROOT / "src").glob("*_local_connector.py"))
+    assert connector_paths
+    guarded_calls = 0
+    for path in connector_paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        oserror_calls = {
+            id(call)
+            for handler in ast.walk(tree)
+            if isinstance(handler, ast.ExceptHandler) and catches_oserror(handler)
+            for statement in handler.body
+            for call in ast.walk(statement)
+            if isinstance(call, ast.Call) and call_name(call) == "append_source_file"
+        }
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call) or call_name(call) != "append_source_file":
+                continue
+            policy = next(
+                (keyword.value for keyword in call.keywords if keyword.arg == "continue_on_divergence"),
+                None,
+            )
+            location = f"{path.relative_to(ROOT)}:{call.lineno}"
+            if id(call) in oserror_calls:
+                assert not (
+                    isinstance(policy, ast.Constant) and policy.value is True
+                ), f"{location} must stay fail-closed when source stat raises OSError"
+                continue
+            guarded_calls += 1
+            assert isinstance(policy, ast.Constant) and policy.value is True, (
+                f"{location} must explicitly pass continue_on_divergence=True"
+            )
+    assert guarded_calls >= 3
+
+
 def test_release_gate_rejects_private_top_level_agent_rules(tmp_path):
     gate = _load_release_gate()
     (tmp_path / "AGENTS.md").write_text("private local agent rules", encoding="utf-8")
@@ -311,6 +364,24 @@ def test_release_gate_rejects_personal_identity_terms(tmp_path):
         assert "personal identity" in str(exc)
     else:
         raise AssertionError("release gate allowed a personal identity term in public source")
+
+
+def test_release_gate_rejects_lob_credential_shapes_without_echoing_value(tmp_path):
+    gate = _load_release_gate()
+    src = tmp_path / "src"
+    src.mkdir()
+    candidate = ("li" + "ve_") + ("a" * 35)
+    (src / "public_module.py").write_text(f"VALUE = {candidate!r}\n", encoding="utf-8")
+
+    try:
+        gate.assert_no_lob_credential_shapes(tmp_path)
+    except SystemExit as exc:
+        message = str(exc)
+        assert "src/public_module.py:1" in message
+        assert "Lob credential-shaped value" in message
+        assert candidate not in message
+    else:
+        raise AssertionError("release gate allowed a Lob credential-shaped value")
 
 
 def test_release_gate_requires_neutral_license_identity(tmp_path):

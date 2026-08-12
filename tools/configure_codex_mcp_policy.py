@@ -1,166 +1,140 @@
 #!/usr/bin/env python3
-"""Apply narrow Codex MCP approval policy without rewriting unrelated config."""
+"""Deprecated compatibility entry point for the Codex MCP config guard.
+
+Older installers called this helper after ``codex mcp add`` to adjust approval
+tables.  Keeping a second TOML writer would recreate the same race that the
+guard fixes, so this entry point now delegates to
+``codex_mcp_config_guard.reconcile_codex_mcp`` and refuses to guess an install
+root when the existing server is not an owned Time Library bridge.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import stat
-import tempfile
+import sys
 from pathlib import Path
+from typing import Sequence
+
+try:
+    from tools.codex_mcp_config_guard import (
+        BRIDGE_FILENAME,
+        DEFAULT_APPROVED_TOOLS,
+        REGISTRY_RELATIVE_PATH,
+        _parse_toml,
+        reconcile_codex_mcp,
+    )
+except ModuleNotFoundError:  # direct execution from an installed tools directory
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.codex_mcp_config_guard import (
+        BRIDGE_FILENAME,
+        DEFAULT_APPROVED_TOOLS,
+        REGISTRY_RELATIVE_PATH,
+        _parse_toml,
+        reconcile_codex_mcp,
+    )
 
 
 DEFAULT_SERVER = "time-library"
-DEFAULT_APPROVED_TOOLS = (
-    "time_library_recall",
-    "time_library_delivery_ack",
-)
 
 
-def _header_variants(server: str, tool: str = "") -> set[str]:
-    server_keys = (server, f'"{server}"', f"'{server}'")
-    suffix = f".tools.{tool}" if tool else ""
-    return {f"[mcp_servers.{server_key}{suffix}]" for server_key in server_keys}
+def _legacy_result(*, error: str, server: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "changed": False,
+        "write_performed": False,
+        "backup_created": False,
+        "server": server,
+        "error": error,
+        "reason": error,
+        "deprecated": True,
+        "implementation": "codex_mcp_config_guard",
+    }
 
 
-def _is_table_header(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.startswith("[") and "]" in stripped
+def _infer_install_root(config_path: Path, *, server: str) -> tuple[Path | None, str | None, str | None]:
+    """Find an installed bridge without inspecting or printing sensitive values."""
 
-
-def _find_sections(lines: list[str], headers: set[str]) -> list[tuple[int, int]]:
-    starts = [index for index, line in enumerate(lines) if line.strip() in headers]
-    sections: list[tuple[int, int]] = []
-    for start in starts:
-        end = len(lines)
-        for index in range(start + 1, len(lines)):
-            if _is_table_header(lines[index]):
-                end = index
-                break
-        sections.append((start, end))
-    return sections
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    mode = stat.S_IMODE(path.stat().st_mode)
-    temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline="",
-            dir=path.parent,
-            prefix=f".{path.name}.time-library-policy-",
-            delete=False,
-        ) as handle:
-            handle.write(text)
-            temporary_path = Path(handle.name)
-        os.chmod(temporary_path, mode)
-        os.replace(temporary_path, path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        original = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, None, "codex_config_not_found"
+    except OSError:
+        return None, None, "codex_config_unreadable"
+    data, parse_error = _parse_toml(original)
+    if parse_error:
+        return None, None, parse_error
+    assert data is not None
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict) or not isinstance(servers.get(server), dict):
+        return None, None, "codex_mcp_server_section_missing"
+    server_data = servers[server]
+    args = server_data.get("args")
+    command = server_data.get("command")
+    command_text = command if isinstance(command, str) and command.strip() else None
+    if not isinstance(args, list):
+        return None, command_text, "codex_mcp_guard_required"
+    for value in args:
+        if not isinstance(value, str) or not value.casefold().endswith(BRIDGE_FILENAME.casefold()):
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            continue
+        candidate = candidate.resolve(strict=False)
+        if candidate.name.casefold() != BRIDGE_FILENAME.casefold() or not candidate.is_file():
+            continue
+        install_root = candidate.parent.parent
+        if (install_root / REGISTRY_RELATIVE_PATH).is_file():
+            return install_root, command_text, None
+    return None, command_text, "codex_mcp_guard_required"
 
 
 def configure_codex_mcp_policy(
     config_path: Path,
     *,
     server: str = DEFAULT_SERVER,
-    approved_tools: tuple[str, ...] = DEFAULT_APPROVED_TOOLS,
+    approved_tools: Sequence[str] = DEFAULT_APPROVED_TOOLS,
+    install_root: Path | None = None,
+    python_executable: str | None = None,
 ) -> dict[str, object]:
+    """Delegate legacy approval updates to the single guarded writer.
+
+    ``install_root`` is optional only for compatibility.  When omitted, it is
+    inferred from an existing absolute bridge argument; otherwise the function
+    fails closed instead of editing a same-name foreign MCP table.
+    """
+
     config_path = config_path.expanduser()
-    if not config_path.is_file():
-        return {
-            "ok": False,
-            "changed": False,
-            "write_performed": False,
-            "error": "codex_config_not_found",
-        }
+    inferred_command: str | None = None
+    if install_root is None:
+        install_root, inferred_command, error = _infer_install_root(config_path, server=server)
+        if error:
+            return _legacy_result(error=error, server=server)
+    if install_root is None:
+        return _legacy_result(error="codex_mcp_guard_required", server=server)
 
-    with config_path.open("r", encoding="utf-8", newline="") as handle:
-        original = handle.read()
-    newline = "\r\n" if "\r\n" in original else "\n"
-    lines = original.splitlines(keepends=True)
-
-    server_sections = _find_sections(lines, _header_variants(server))
-    if len(server_sections) != 1:
-        return {
-            "ok": False,
-            "changed": False,
-            "write_performed": False,
-            "error": "codex_mcp_server_section_missing"
-            if not server_sections
-            else "duplicate_codex_mcp_server_sections",
-        }
-
-    for tool in approved_tools:
-        sections = _find_sections(lines, _header_variants(server, tool))
-        if len(sections) > 1:
-            return {
-                "ok": False,
-                "changed": False,
-                "write_performed": False,
-                "error": f"duplicate_codex_mcp_tool_section:{tool}",
-            }
-        if sections:
-            start, end = sections[0]
-            assignment_indexes = [
-                index
-                for index in range(start + 1, end)
-                if lines[index].lstrip().startswith("approval_mode")
-                and "=" in lines[index]
-            ]
-            if len(assignment_indexes) > 1:
-                return {
-                    "ok": False,
-                    "changed": False,
-                    "write_performed": False,
-                    "error": f"duplicate_codex_mcp_approval_mode:{tool}",
-                }
-            if assignment_indexes:
-                lines[assignment_indexes[0]] = f'approval_mode = "approve"{newline}'
-            else:
-                lines.insert(end, f'approval_mode = "approve"{newline}')
-            continue
-
-        if lines and lines[-1].strip():
-            lines.append(newline)
-        lines.extend(
-            [
-                f"[mcp_servers.{server}.tools.{tool}]{newline}",
-                f'approval_mode = "approve"{newline}',
-            ]
+    result = dict(
+        reconcile_codex_mcp(
+            config_path,
+            install_root,
+            python_executable=python_executable or inferred_command or "python3",
+            server=server,
+            approved_tools=tuple(approved_tools),
         )
-
-    updated = "".join(lines)
-    changed = updated != original
-    backup_created = False
-    if changed:
-        backup_path = config_path.with_name(
-            config_path.name + ".time-library-policy.backup"
-        )
-        shutil.copy2(config_path, backup_path)
-        backup_created = True
-        _atomic_write(config_path, updated)
-
-    return {
-        "ok": True,
-        "changed": changed,
-        "write_performed": changed,
-        "backup_created": backup_created,
-        "server": server,
-        "approved_tools": list(approved_tools),
-        "other_tools_auto_approved": False,
-    }
+    )
+    result["deprecated"] = True
+    result["implementation"] = "codex_mcp_config_guard"
+    if not result.get("ok"):
+        result["error"] = result.get("reason") or "codex_mcp_guard_failed"
+    return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--server", default=DEFAULT_SERVER)
+    parser.add_argument("--install-root", type=Path)
+    parser.add_argument("--python-executable")
     parser.add_argument("--approve-tool", action="append", default=[])
     args = parser.parse_args()
     approved_tools = tuple(args.approve_tool) or DEFAULT_APPROVED_TOOLS
@@ -168,6 +142,8 @@ def main() -> int:
         args.config,
         server=args.server,
         approved_tools=approved_tools,
+        install_root=args.install_root,
+        python_executable=args.python_executable,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 2

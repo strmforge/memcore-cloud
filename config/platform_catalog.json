@@ -67,7 +67,7 @@
         "supported": true,
         "config_keys": ["mcp_servers"],
         "candidate_config_paths": ["~/.codex/config.toml"],
-        "preferred_apply": "codex mcp add <name> --url <url>"
+        "preferred_apply": "use the host-owned MCP configuration surface; for Time Library, use its installed narrow Codex MCP guard rather than a whole-file CLI rewrite"
       },
       "workspace_markers": [".codex", ".codex-pro", "Codex++", "CodexPro", "AGENTS.md"],
       "confidence": "high",

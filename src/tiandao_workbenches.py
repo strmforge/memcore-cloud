@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 try:
+    from raw_record_recoverability import lost_source_triage as _lost_source_triage
+except ImportError:  # pragma: no cover
+    from src.raw_record_recoverability import lost_source_triage as _lost_source_triage
+
+try:
     from src.continuous_sync_status import build_continuous_sync_status
     from src.material_processing_pipeline import get_material_processing_pipeline_contract
     from src.platform_thin_adapter_registry import build_platform_discovery_dashboard
@@ -126,6 +131,7 @@ def _origin_guard(
     time_twin_star: dict[str, Any],
 ) -> dict[str, Any]:
     summary = guardian.get("summary") if isinstance(guardian.get("summary"), dict) else {}
+    summary_scope = guardian.get("summary_scope") if isinstance(guardian.get("summary_scope"), dict) else {}
     sync_summary = continuous_sync.get("summary") if isinstance(continuous_sync.get("summary"), dict) else {}
     watcher = continuous_sync.get("watcher") if isinstance(continuous_sync.get("watcher"), dict) else {}
     raw_not_current = _safe_int(summary.get("raw_not_current_count"))
@@ -136,7 +142,7 @@ def _origin_guard(
         summary.get("raw_attention_count"),
         backfill,
     )
-    lost_source = _safe_int(summary.get("lost_source_count"))
+    lost_source, recoverable_source, unrecoverable_source, unmeasured_source = _lost_source_triage(summary)
     lost_raw = _safe_int(summary.get("lost_raw_count"))
     corrupt = _safe_int(summary.get("corrupt_record_count"))
     ok = (
@@ -144,16 +150,21 @@ def _origin_guard(
         and raw_attention == 0
         and backfill == 0
         and corrupt == 0
-        and lost_source == 0
+        and unrecoverable_source == 0
         and lost_raw == 0
     )
     health = "ok" if ok else "needs_attention"
-    if lost_source or lost_raw:
+    if unrecoverable_source or lost_raw:
         health = "lost_evidence_detected"
     elif raw_attention or backfill:
         health = "raw_not_current"
+    elif unmeasured_source:
+        health = "recoverability_unmeasured"
     elif raw_catching_up:
         health = "raw_catching_up"
+    elif summary_scope.get("summary_is_sample"):
+        health = "population_scope_incomplete"
+        ok = False
     return {
         "id": "origin_guard",
         "zh_name": "时间起源守护",
@@ -172,12 +183,24 @@ def _origin_guard(
         ],
         "summary": {
             "record_count": _safe_int(summary.get("record_count")),
+            "physical_record_count": _safe_int(summary.get("physical_record_count")),
+            "logical_record_count": _safe_int(summary.get("logical_record_count")),
+            "layout_variant_count": _safe_int(summary.get("layout_variant_count")),
             "record_guarded_count": _safe_int(summary.get("record_guarded_count")),
             "raw_not_current_count": raw_not_current,
             "raw_attention_count": raw_attention,
+            "raw_divergence_generation_active_count": _safe_int(
+                summary.get("raw_divergence_generation_active_count")
+            ),
+            "raw_metadata_only_divergence_count": _safe_int(summary.get("raw_metadata_only_divergence_count")),
             "raw_lagging_or_missing_count": raw_lagging_or_missing,
             "raw_catching_up_count": raw_catching_up,
             "lost_source_count": lost_source,
+            "lost_source_recoverable_count": recoverable_source,
+            "lost_source_unrecoverable_count": unrecoverable_source,
+            "lost_source_not_measured_count": unmeasured_source,
+            "lost_source_one_sided_count": _safe_int(summary.get("lost_source_one_sided_count")),
+            "lost_source_non_conversation_count": _safe_int(summary.get("lost_source_non_conversation_count")),
             "lost_raw_count": lost_raw,
             "backfill_recommended_count": backfill,
             "origin_event_count": _safe_int(summary.get("origin_event_count")),
@@ -200,6 +223,7 @@ def _origin_guard(
         },
         "evidence": {
             "guardian_summary": summary,
+            "guardian_summary_scope": summary_scope,
             "continuous_sync_summary": sync_summary,
             "time_twin_star_status": time_twin_star,
             "gap_sources": guardian.get("gap_sources", []),
@@ -213,7 +237,8 @@ def _origin_guard(
             "/api/v1/tiandao/time-twin-star/status",
         ],
         "next_actions": [
-            "repair_lost_source_or_lost_raw_first" if (lost_source or lost_raw) else "",
+            "repair_unrecoverable_source_or_lost_raw_first" if (unrecoverable_source or lost_raw) else "",
+            "complete_bounded_recoverability_evidence" if unmeasured_source else "",
             "run_explicit_backfill_if_raw_not_current" if backfill else "",
             "watch_active_tail_catchup_without_marking_record_lost" if (raw_catching_up and not raw_attention and not backfill) else "",
             "keep_canonical_index_as_ui_and_recovery_base",
@@ -518,7 +543,7 @@ def build_tiandao_workbenches_dashboard(
         _experience_governance(governance, manifest, replay, benchmark, loop),
         _hermes_learning_observatory(liveness, triggers, probes, statuses, diff_plan, report_plan),
     ]
-    attention = [item for item in workbenches if item.get("health") not in {"ok", "ready", "detected", "dry_run_governed", "observable", "no_local_tool_sample", "raw_catching_up"}]
+    attention = [item for item in workbenches if item.get("health") not in {"ok", "ready", "detected", "dry_run_governed", "observable", "no_local_tool_sample", "raw_catching_up", "recoverability_unmeasured"}]
     origin = workbenches[0].get("summary", {})
     return {
         **contract,
@@ -534,6 +559,9 @@ def build_tiandao_workbenches_dashboard(
             "raw_lagging_or_missing_count": _safe_int(origin.get("raw_lagging_or_missing_count")),
             "raw_catching_up_count": _safe_int(origin.get("raw_catching_up_count")),
             "lost_source_count": _safe_int(origin.get("lost_source_count")),
+            "lost_source_recoverable_count": _safe_int(origin.get("lost_source_recoverable_count")),
+            "lost_source_unrecoverable_count": _safe_int(origin.get("lost_source_unrecoverable_count")),
+            "lost_source_not_measured_count": _safe_int(origin.get("lost_source_not_measured_count")),
             "lost_raw_count": _safe_int(origin.get("lost_raw_count")),
             "backfill_recommended_count": _safe_int(origin.get("backfill_recommended_count")),
             "max_raw_lag_milliseconds": _safe_int(origin.get("max_raw_lag_milliseconds")),
@@ -545,7 +573,7 @@ def build_tiandao_workbenches_dashboard(
             "record_first_ready": _safe_int(origin.get("raw_attention_count")) == 0
             and _safe_int(origin.get("backfill_recommended_count")) == 0
             and _safe_int(origin.get("corrupt_record_count")) == 0
-            and _safe_int(origin.get("lost_source_count")) == 0
+            and _safe_int(origin.get("lost_source_unrecoverable_count")) == 0
             and _safe_int(origin.get("lost_raw_count")) == 0,
         },
         "workbenches": workbenches,

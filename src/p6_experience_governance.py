@@ -1939,7 +1939,7 @@ def apply_experience_service_hermes_upgrade_input(upgrade_input_id, body=None):
         "authorization_checks": required_checks,
         "guard_checks": guard_checks,
         "notes": [
-            "live_experience_service_semantic_upgrade",
+            "experience_service_live_semantic_upgrade",
             "upgrade_uses_case_memory_version_and_lifecycle_overlay",
             "raw_source_refs_preserved_without_desensitization",
         ],
