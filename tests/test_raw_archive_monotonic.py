@@ -12,6 +12,7 @@ from src.raw_archive_monotonic import (
     append_source_file,
     generation_descriptor_path,
     load_generation_descriptor,
+    select_archive_segment_metadata_only,
 )
 
 
@@ -63,6 +64,85 @@ def test_source_prefix_rewrite_is_reported_without_archive_mutation(tmp_path):
     assert result["source_divergence"] is True
     assert result["write_performed"] is False
     assert archive.read_bytes() == original
+
+
+def test_metadata_only_segment_cache_indexes_each_directory_without_crossing_archives(
+    tmp_path,
+    monkeypatch,
+):
+    archive_dir = tmp_path / "memory" / "project"
+    archive_dir.mkdir(parents=True)
+    first = archive_dir / "first.jsonl"
+    first_segment = archive_dir / "first.seg1.jsonl"
+    second = archive_dir / "second.jsonl"
+    second_segment = archive_dir / "second.seg1.jsonl"
+    for path in (first, first_segment, second, second_segment):
+        path.write_bytes(b'{}\n')
+    (archive_dir / "first.seg1.jsonl.canonical_dialogue.jsonl").write_bytes(b'{}\n')
+    (archive_dir / "first.seg1.jsonl.forensic_runtime.jsonl").write_bytes(b'{}\n')
+
+    original_iterdir = Path.iterdir
+    directory_scans = 0
+
+    def count_directory_scans(path):
+        nonlocal directory_scans
+        if path == archive_dir:
+            directory_scans += 1
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", count_directory_scans)
+    cache = {}
+    first_selection = select_archive_segment_metadata_only(
+        first,
+        None,
+        directory_cache=cache,
+    )
+    second_selection = select_archive_segment_metadata_only(
+        second,
+        None,
+        directory_cache=cache,
+    )
+
+    assert directory_scans == 1
+    assert first_selection["candidate_count"] == 2
+    assert Path(first_selection["retained_archive_path"]) == first_segment
+    assert second_selection["candidate_count"] == 2
+    assert Path(second_selection["retained_archive_path"]) == second_segment
+
+
+def test_metadata_only_segment_discovery_rejects_derived_jsonl_sidecars(tmp_path):
+    archive = tmp_path / "session.jsonl"
+    segment = tmp_path / "session.seg1.jsonl"
+    derived = tmp_path / "session.seg1.jsonl.canonical_dialogue.jsonl"
+    for path in (archive, segment, derived):
+        path.write_bytes(b'{}\n')
+    Path(str(derived) + ".meta.json").write_text(
+        json.dumps({"source_inode": 42}),
+        encoding="utf-8",
+    )
+
+    selection = select_archive_segment_metadata_only(archive, 42)
+
+    assert selection["candidate_count"] == 2
+    assert Path(selection["archive_path"]) != derived
+    assert Path(selection["retained_archive_path"]) == segment
+
+
+def test_metadata_only_segment_selection_uses_latest_verified_inode_segment(tmp_path):
+    archive = tmp_path / "session.jsonl"
+    requested = tmp_path / "session.seg2.jsonl"
+    for path in (archive, requested):
+        path.write_bytes(b'{}\n')
+        Path(str(path) + ".meta.json").write_text(
+            json.dumps({"source_inode": 42}),
+            encoding="utf-8",
+        )
+
+    selection = select_archive_segment_metadata_only(archive, 42)
+
+    assert selection["selection_status"] == "source_inode_sidecar"
+    assert Path(selection["archive_path"]) == requested
+    assert selection["selection_proven_by_metadata"] is True
 
 
 def test_unchanged_files_reuse_verified_prefix_without_full_scan(tmp_path, monkeypatch):

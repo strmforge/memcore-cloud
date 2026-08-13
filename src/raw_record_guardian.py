@@ -205,10 +205,10 @@ def _public_path_label(path: str | Path) -> str:
         return ""
     try:
         p = Path(text).expanduser()
-        home = Path.home().resolve()
-        resolved = p.resolve(strict=False)
+        home = Path(os.path.abspath(Path.home()))
+        absolute = Path(os.path.abspath(p))
         try:
-            rel = resolved.relative_to(home)
+            rel = absolute.relative_to(home)
             return _sanitize_public_text("~/" + str(rel))
         except ValueError:
             return _sanitize_public_text(str(p))
@@ -723,12 +723,22 @@ def _connector_records(
     )
 
     records: list[dict[str, Any]] = []
+    sync_context: dict[str, Any] = {}
     for artifact in artifacts:
         source_path = artifact.get("source_path", "")
         sync_item = {}
         if hasattr(module, "_raw_sync_item"):
             try:
-                sync_item = module._raw_sync_item(artifact, scan_mode=scan_mode)
+                try:
+                    sync_item = module._raw_sync_item(
+                        artifact,
+                        scan_mode=scan_mode,
+                        scan_context=sync_context,
+                    )
+                except TypeError as exc:
+                    if "scan_context" not in str(exc):
+                        raise
+                    sync_item = module._raw_sync_item(artifact, scan_mode=scan_mode)
             except TypeError as exc:
                 if "scan_mode" in str(exc):
                     try:

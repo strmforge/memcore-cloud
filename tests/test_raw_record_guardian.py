@@ -3182,10 +3182,19 @@ def test_fast_guardian_scales_to_full_population_without_body_or_prefix_reads(tm
         encoding="utf-8",
     )
     artifacts = [artifact] * 1251
+    original_iterdir = Path.iterdir
+    archive_directory_scans = 0
+
+    def count_archive_directory_scans(path):
+        nonlocal archive_directory_scans
+        if path == raw_path.parent:
+            archive_directory_scans += 1
+        return original_iterdir(path)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("fast Guardian read a source/raw body or invoked prefix append")
 
+    monkeypatch.setattr(Path, "iterdir", count_archive_directory_scans)
     monkeypatch.setattr(codex_local_connector, "select_archive_segment", forbidden)
     monkeypatch.setattr(codex_local_connector, "append_source_file", forbidden)
     monkeypatch.setattr(codex_local_connector, "cached_divergence_witness_visible", forbidden)
@@ -3210,6 +3219,7 @@ def test_fast_guardian_scales_to_full_population_without_body_or_prefix_reads(tm
     assert report["summary_scope"]["sources"]["codex"]["targeted"] is True
     assert report["record_detail_count"] == 1
     assert report["records"][0]["sync"]["raw_body_read_performed"] is False
+    assert archive_directory_scans == 1
 
 
 def test_fast_guardian_full_discovery_population_over_detail_limit_remains_complete(tmp_path, monkeypatch):
@@ -3355,6 +3365,166 @@ def test_codex_inode_drift_metadata_only_rewrite_is_not_raw_lag(
     assert snapshot["raw_metadata_only_divergence_count"] == 1
     assert snapshot["raw_overrun_count"] == 0
     assert snapshot["missing_or_stale_count"] == 0
+
+
+def test_codex_fast_guardian_reuses_persisted_metadata_only_witness_without_body_read(
+    tmp_path,
+    monkeypatch,
+):
+    import codex_local_connector
+    import raw_record_guardian
+
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    _configure_env(monkeypatch, tmp_path, codex_sessions, session_index)
+    records = [json.loads(line) for line in session_path.read_text(encoding="utf-8").splitlines()]
+    records[0]["payload"]["model_provider"] = "custom-provider"
+    session_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    first_scan = codex_local_connector.scan_sessions(dry_run=False, limit=20)
+    raw_path = Path(first_scan["items"][0]["dest"])
+    raw_before = raw_path.read_bytes()
+
+    records[0]["payload"]["model_provider"] = "x"
+    session_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    artifact = codex_local_connector.artifact_from_path(session_path)
+    dest, status = codex_local_connector.archive_session_incremental(
+        str(session_path),
+        artifact=artifact,
+    )
+    witness_path = Path(
+        str(dest) + codex_local_connector.METADATA_DIVERGENCE_WITNESS_SUFFIX
+    )
+
+    assert status.startswith("source_divergence_metadata_only_raw_retained")
+    assert Path(dest) == raw_path
+    assert witness_path.is_file()
+    witness_text = witness_path.read_text(encoding="ascii")
+    assert str(session_path) not in witness_text
+    assert "custom-provider" not in witness_text
+    assert raw_path.read_bytes() == raw_before
+    checkpoint = codex_local_connector.load_checkpoint()
+    assert checkpoint[codex_local_connector._checkpoint_key(str(session_path))]["archived_to"] == str(raw_path)
+
+    def body_probe_must_not_run(*_args, **_kwargs):
+        raise AssertionError("fast Guardian reran the metadata body probe")
+
+    monkeypatch.setattr(
+        codex_local_connector,
+        "_metadata_only_divergence_probe",
+        body_probe_must_not_run,
+    )
+    report = raw_record_guardian.build_guardian_status(
+        limit=20,
+        include_gaps=False,
+        scan_mode="fast",
+        public=False,
+        source_systems=["codex"],
+    )
+    item = report["records"][0]
+
+    assert item["guard_status"] == "source_divergence_metadata_only_raw_retained"
+    assert item["sync"]["raw_metadata_only_divergence"] is True
+    assert item["sync"]["raw_source_regression"] is False
+    assert item["sync"]["raw_archive_lag_bytes"] == 0
+    assert item["sync"]["raw_body_read_performed"] is False
+    assert item["sync"]["metadata_divergence_probe"]["witness_hit"] is True
+    assert item["backfill_recommended"] is False
+    assert report["summary"]["raw_metadata_only_divergence_count"] == 1
+    assert report["summary"]["raw_source_regression_count"] == 0
+    assert report["summary"]["raw_attention_count"] == 0
+
+
+def test_codex_metadata_only_cached_probe_can_still_persist_witness(tmp_path):
+    import codex_local_connector
+
+    source = tmp_path / "source.jsonl"
+    archive = tmp_path / "archive.jsonl"
+    source.write_text(
+        '{"payload":{"model_provider":"new","text":"same"}}\n',
+        encoding="utf-8",
+    )
+    archive.write_text(
+        '{"payload":{"model_provider":"archived-provider","text":"same"}}\n',
+        encoding="utf-8",
+    )
+    codex_local_connector._METADATA_DIVERGENCE_CACHE.clear()
+
+    first = codex_local_connector._metadata_only_divergence_probe(source, archive)
+    assert first["matched"] is True
+    assert not codex_local_connector._metadata_divergence_witness_path(archive).exists()
+
+    second = codex_local_connector._metadata_only_divergence_probe(
+        source,
+        archive,
+        persist_witness=True,
+    )
+
+    assert second["cache_hit"] is True
+    assert second["witness_written"] is True
+    witness = codex_local_connector._load_metadata_divergence_witness(source, archive)
+    assert witness["matched"] is True
+    assert witness["witness_hit"] is True
+
+
+def test_codex_metadata_only_witness_rejects_non_regression_pair(tmp_path):
+    import codex_local_connector
+
+    source = tmp_path / "source.jsonl"
+    archive = tmp_path / "archive.jsonl"
+    source.write_text(
+        '{"payload":{"model_provider":"longer-provider","text":"same"}}\n',
+        encoding="utf-8",
+    )
+    archive.write_text(
+        '{"payload":{"model_provider":"x","text":"same"}}\n',
+        encoding="utf-8",
+    )
+
+    result = codex_local_connector._metadata_only_divergence_probe(
+        source,
+        archive,
+        persist_witness=True,
+    )
+
+    assert result["matched"] is True
+    assert result["witness_written"] is False
+    assert not codex_local_connector._metadata_divergence_witness_path(archive).exists()
+
+
+def test_codex_fast_guardian_rejects_stale_metadata_only_witness(tmp_path, monkeypatch):
+    import codex_local_connector
+
+    source = tmp_path / "source.jsonl"
+    archive = tmp_path / "archive.jsonl"
+    source.write_text(
+        json.dumps({"payload": {"model_provider": "x", "value": 1}}) + "\n",
+        encoding="utf-8",
+    )
+    archive.write_text(
+        json.dumps({"payload": {"model_provider": "long", "value": 1}}) + "\n",
+        encoding="utf-8",
+    )
+    probe = codex_local_connector._metadata_only_divergence_probe(
+        source,
+        archive,
+        persist_witness=True,
+    )
+    assert probe["matched"] is True
+    assert probe["witness_written"] is True
+
+    source.write_text(
+        json.dumps({"payload": {"model_provider": "x", "value": 2}}) + "\n",
+        encoding="utf-8",
+    )
+    witness = codex_local_connector._load_metadata_divergence_witness(source, archive)
+
+    assert witness["matched"] is False
+    assert witness["status"] == "witness_stale_or_invalid"
 
 
 def test_lost_source_non_conversation_layout_variants_are_one_logical_record(tmp_path, monkeypatch):

@@ -33,6 +33,11 @@
 
 - Consolidated the source-preserving record, recoverability, unattended
   Guardian, and credential-shape release safeguards into the current candidate.
+- Corrected Codex Guardian archive selection so canonical/forensic sidecars
+  cannot be mistaken for raw sessions, and added a stat-bound witness for the
+  narrow case where raw safely retains a longer pre-rewrite record whose only
+  source difference is `payload.model_provider`. Equal or larger rewrites keep
+  using divergence generations rather than this witness shortcut.
 - Kept public downloads pinned to the latest published 2026.7.18 assets until
   a separate publication authorization is given.
 

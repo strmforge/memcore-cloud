@@ -84,6 +84,8 @@ DEFAULT_RAW_LAG_SLA_MS = 1000
 DEFAULT_BACKFILL_RECOMMEND_AFTER_MS = 5000
 METADATA_DIVERGENCE_MAX_FILE_BYTES = 16 * 1024 * 1024
 METADATA_DIVERGENCE_CACHE_LIMIT = 256
+METADATA_DIVERGENCE_WITNESS_CONTRACT = "time_library_codex_metadata_divergence_witness.v1"
+METADATA_DIVERGENCE_WITNESS_SUFFIX = ".metadata-divergence.json"
 _METADATA_DIVERGENCE_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
 
 
@@ -123,10 +125,10 @@ def _public_path_label(path: str) -> str:
         return ""
     try:
         p = Path(path).expanduser()
-        home = Path.home().resolve()
-        resolved = p.resolve()
+        home = Path(os.path.abspath(Path.home()))
+        absolute = Path(os.path.abspath(p))
         try:
-            rel = resolved.relative_to(home)
+            rel = absolute.relative_to(home)
             return "~/" + str(rel)
         except ValueError:
             return p.name or path
@@ -420,12 +422,62 @@ def _raw_archive_path_index() -> Dict[str, List[Path]]:
     }
 
 
+def _checkpoint_raw_archive_hint(
+    source_path: Path,
+    session_id: str,
+    checkpoint: Dict[str, Any] | None,
+) -> Path | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    row = checkpoint.get(_checkpoint_key(str(source_path)))
+    if not isinstance(row, dict):
+        return None
+    archived_to = str(row.get("archived_to") or "").strip()
+    if not archived_to:
+        return None
+    candidate = Path(archived_to).expanduser()
+    safe_session = _safe_segment(session_id, "session")
+    if not re.fullmatch(
+        re.escape(safe_session) + r"(?:\.seg\d+)?\.jsonl",
+        candidate.name,
+    ):
+        return None
+    try:
+        candidate.resolve().relative_to(Path(memory_root()).expanduser().resolve())
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_file():
+        return None
+    try:
+        source_inode = int(source_path.stat().st_ino)
+        metadata = json.loads(
+            Path(str(candidate) + ".meta.json").read_text(encoding="utf-8-sig")
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        metadata_inode = int(metadata.get("source_inode") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        _path_key(metadata.get("source_path")) != _path_key(source_path)
+        or str(metadata.get("session_id") or "") != session_id
+        or not source_inode
+        or metadata_inode != source_inode
+    ):
+        return None
+    return candidate
+
+
 def artifact_from_path(
     path: Path,
     index: Optional[Dict[str, dict]] = None,
     thread_index: Optional[Dict[str, Any]] = None,
     raw_archive_index: Optional[Dict[str, List[Path]]] = None,
     scan_mode: str = "full",
+    checkpoint: Optional[Dict[str, Any]] = None,
 ) -> dict:
     path = path.expanduser()
     scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
@@ -443,7 +495,18 @@ def artifact_from_path(
         if isinstance(raw_archive_index, dict)
         else []
     )
-    raw_archive_path_hint = raw_candidates[0] if len(raw_candidates) == 1 else None
+    checkpoint_hint = (
+        _checkpoint_raw_archive_hint(path, session_id, checkpoint)
+        if len(raw_candidates) != 1
+        else None
+    )
+    raw_archive_path_hint = (
+        checkpoint_hint
+        if checkpoint_hint is not None
+        else raw_candidates[0]
+        if len(raw_candidates) == 1
+        else None
+    )
     project_id = (
         raw_archive_path_hint.parent.name
         if not cwd and raw_archive_path_hint is not None
@@ -483,8 +546,10 @@ def artifact_from_path(
         "session_meta_body_read_performed": scan_mode == "full",
         "raw_archive_path_hint": str(raw_archive_path_hint or ""),
         "raw_archive_identity_status": (
-            "matched_unique"
-            if raw_archive_path_hint is not None
+            "matched_checkpoint"
+            if checkpoint_hint is not None
+            else "matched_unique"
+            if len(raw_candidates) == 1
             else "ambiguous"
             if len(raw_candidates) > 1
             else "not_indexed"
@@ -504,6 +569,7 @@ def discover_sessions(limit: int = 0, scan_mode: str = "full") -> List[dict]:
     if limit and limit > 0:
         files = files[:limit]
     raw_archive_index = _raw_archive_path_index() if scan_mode == "fast" else {}
+    checkpoint = load_checkpoint() if scan_mode == "fast" else {}
     artifacts = []
     for path in files:
         try:
@@ -513,6 +579,7 @@ def discover_sessions(limit: int = 0, scan_mode: str = "full") -> List[dict]:
                     index=index,
                     thread_index=thread_index,
                     raw_archive_index=raw_archive_index,
+                    checkpoint=checkpoint,
                     scan_mode=scan_mode,
                 )
             )
@@ -607,6 +674,113 @@ def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
     )
 
 
+def _metadata_divergence_witness_path(archive: Path) -> Path:
+    return Path(str(archive) + METADATA_DIVERGENCE_WITNESS_SUFFIX)
+
+
+def _seal_metadata_divergence_witness(payload: dict[str, Any]) -> dict[str, Any]:
+    sealed = dict(payload)
+    sealed.pop("witness_sha256", None)
+    encoded = json.dumps(
+        sealed,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    sealed["witness_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return sealed
+
+
+def _write_metadata_divergence_witness(
+    source: Path,
+    archive: Path,
+    result: dict[str, Any],
+) -> bool:
+    source_identity = _file_identity(source)
+    archive_identity = _file_identity(archive)
+    if (
+        not result.get("matched")
+        or source_identity is None
+        or archive_identity is None
+        or archive_identity[2] <= source_identity[2]
+    ):
+        return False
+    payload = _seal_metadata_divergence_witness({
+        "contract": METADATA_DIVERGENCE_WITNESS_CONTRACT,
+        "status": "metadata_only",
+        "metadata_only_fields": list(result.get("metadata_only_fields") or []),
+        "compared_line_count": int(result.get("compared_line_count") or 0),
+        "changed_line_count": int(result.get("changed_line_count") or 0),
+        "source_identity": list(source_identity),
+        "archive_identity": list(archive_identity),
+    })
+    target = _metadata_divergence_witness_path(archive)
+    temporary = target.with_name(
+        target.name + f".{os.getpid()}.{time.monotonic_ns()}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
+            encoding="ascii",
+        )
+        os.replace(temporary, target)
+    except OSError:
+        return False
+    finally:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def _load_metadata_divergence_witness(source: Path, archive: Path) -> dict[str, Any]:
+    base = {
+        "matched": False,
+        "status": "witness_unavailable",
+        "metadata_only_fields": [],
+        "compared_line_count": 0,
+        "changed_line_count": 0,
+        "bytes_read": 0,
+        "witness_hit": False,
+    }
+    try:
+        payload = json.loads(
+            _metadata_divergence_witness_path(archive).read_text(encoding="ascii")
+        )
+    except (OSError, TypeError, ValueError):
+        return base
+    if not isinstance(payload, dict):
+        return {**base, "status": "witness_invalid"}
+    source_identity = _file_identity(source)
+    archive_identity = _file_identity(archive)
+    expected_sha256 = str(payload.get("witness_sha256") or "")
+    actual_sha256 = _seal_metadata_divergence_witness(payload).get("witness_sha256")
+    fields = payload.get("metadata_only_fields")
+    if (
+        payload.get("contract") != METADATA_DIVERGENCE_WITNESS_CONTRACT
+        or payload.get("status") != "metadata_only"
+        or expected_sha256 != actual_sha256
+        or fields != ["payload.model_provider"]
+        or source_identity is None
+        or archive_identity is None
+        or archive_identity[2] <= source_identity[2]
+        or payload.get("source_identity") != list(source_identity)
+        or payload.get("archive_identity") != list(archive_identity)
+    ):
+        return {**base, "status": "witness_stale_or_invalid"}
+    return {
+        **base,
+        "matched": True,
+        "status": "metadata_only_witness",
+        "metadata_only_fields": list(fields),
+        "compared_line_count": int(payload.get("compared_line_count") or 0),
+        "changed_line_count": int(payload.get("changed_line_count") or 0),
+        "witness_hit": True,
+    }
+
+
 def _metadata_only_line_difference(source_record: Any, archive_record: Any) -> bool:
     if not isinstance(source_record, dict) or not isinstance(archive_record, dict):
         return False
@@ -629,7 +803,12 @@ def _metadata_only_line_difference(source_record: Any, archive_record: Any) -> b
     return source_copy == archive_copy
 
 
-def _metadata_only_divergence_probe(source: Path, archive: Path) -> dict[str, Any]:
+def _metadata_only_divergence_probe(
+    source: Path,
+    archive: Path,
+    *,
+    persist_witness: bool = False,
+) -> dict[str, Any]:
     """Prove a bounded Codex rewrite changed only non-conversation metadata."""
     source_identity = _file_identity(source)
     archive_identity = _file_identity(archive)
@@ -647,7 +826,14 @@ def _metadata_only_divergence_probe(source: Path, archive: Path) -> dict[str, An
     cached = _METADATA_DIVERGENCE_CACHE.get(cache_key)
     if cached is not None:
         _METADATA_DIVERGENCE_CACHE.move_to_end(cache_key)
-        return {**cached, "cache_hit": True}
+        result = {**cached, "cache_hit": True}
+        if cached.get("matched") and persist_witness:
+            result["witness_written"] = _write_metadata_divergence_witness(
+                source,
+                archive,
+                result,
+            )
+        return result
     if max(source_identity[2], archive_identity[2]) > METADATA_DIVERGENCE_MAX_FILE_BYTES:
         return {**base, "status": "byte_limit_exceeded"}
 
@@ -702,10 +888,20 @@ def _metadata_only_divergence_probe(source: Path, archive: Path) -> dict[str, An
         _METADATA_DIVERGENCE_CACHE.move_to_end(cache_key)
         while len(_METADATA_DIVERGENCE_CACHE) > METADATA_DIVERGENCE_CACHE_LIMIT:
             _METADATA_DIVERGENCE_CACHE.popitem(last=False)
+    if matched and persist_witness:
+        result["witness_written"] = _write_metadata_divergence_witness(
+            source,
+            archive,
+            result,
+        )
     return result
 
 
-def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
+def _raw_sync_item(
+    artifact: dict,
+    scan_mode: str = "full",
+    scan_context: dict[str, Any] | None = None,
+) -> dict:
     scan_mode = "fast" if str(scan_mode or "").lower() in {"fast", "stat", "quick"} else "full"
     src = Path(artifact.get("source_path", "")).expanduser()
     src_stat = None
@@ -720,9 +916,13 @@ def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
         source_mtime = artifact.get("mtime", "")
     base_dest = _raw_dest_for_artifact(artifact)
     if scan_mode == "fast":
+        directory_cache = None
+        if isinstance(scan_context, dict):
+            directory_cache = scan_context.setdefault("archive_segment_directories", {})
         selection = select_archive_segment_metadata_only(
             base_dest,
             src_stat.st_ino if src_stat is not None else None,
+            directory_cache=directory_cache,
         )
         selected_dest = Path(selection["archive_path"])
         generation_blockers = [selection] if selection.get("generation_descriptor_incomplete") else []
@@ -745,14 +945,22 @@ def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
             if src_stat is not None
             else latest_archive_segment(base_dest)
         )
-    retained_dest = latest_archive_segment(base_dest)
+    retained_dest = (
+        Path(selection.get("retained_archive_path") or selected_dest)
+        if scan_mode == "fast"
+        else latest_archive_segment(base_dest)
+    )
     metadata_divergence = {
         "matched": False,
         "status": "not_applicable",
         "metadata_only_fields": [],
     }
     dest = selected_dest
-    generation_descriptor = load_generation_descriptor(dest)
+    generation_descriptor = (
+        dict(selection.get("descriptor") or {})
+        if scan_mode == "fast"
+        else load_generation_descriptor(dest)
+    )
     generation_descriptor_incomplete = bool(generation_blockers)
     if generation_descriptor_incomplete:
         dest = Path(str(generation_blockers[-1].get("archive_path") or selected_dest))
@@ -786,6 +994,14 @@ def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
     overrun = bool(dest.exists()) and raw_size > source_size
     stale = bool(dest.exists()) and raw_size < source_size
     source_regression = overrun
+    if (
+        scan_mode == "fast"
+        and dest.exists()
+        and (overrun or stale)
+        and not generation_descriptor_incomplete
+        and not generation_descriptor
+    ):
+        metadata_divergence = _load_metadata_divergence_witness(src, dest)
     source_mtime_ms = _stat_mtime_ms(src_stat)
     raw_mtime_ms = _stat_mtime_ms(dest_stat)
     raw_mtime_gap_ms = max(0, source_mtime_ms - raw_mtime_ms) if stale and source_mtime_ms and raw_mtime_ms else 0
@@ -817,6 +1033,7 @@ def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
         and not missing
         and not generation_descriptor_incomplete
         and not generation_active
+        and not metadata_only_divergence
         and not metadata_continuity_proven
     )
     monotonic_probe_ok: bool | None = None if continuity_not_measured else not generation_descriptor_incomplete
@@ -842,6 +1059,9 @@ def _raw_sync_item(artifact: dict, scan_mode: str = "full") -> dict:
         stale = False
         overrun = False
         source_regression = False
+        continuity_not_measured = False
+        monotonic_probe_ok = True
+        monotonic_status = "source_divergence_metadata_only_raw_retained"
         lag_ms = 0
         lag_bytes = 0
     elif scan_mode == "full" and raw_size and cached_divergence_witness_visible(src, dest, raw_size):
@@ -1309,7 +1529,36 @@ def archive_session_incremental(source_path: str, dry_run: bool = False, artifac
             "source_divergence_generation_fail_closed("
             f"reason={report.get('generation_failure', 'unknown')})"
         )
+    # Persist this shortcut only for a shorter rewritten source whose older raw
+    # bytes remain authoritative. Equal or larger rewrites stay on generations.
     if report.get("source_regression"):
+        metadata_divergence = _metadata_only_divergence_probe(
+            src,
+            dest,
+            persist_witness=not dry_run,
+        )
+        if metadata_divergence.get("matched"):
+            if not dry_run and metadata_divergence.get("witness_written"):
+                checkpoint[key] = {
+                    "offset": src_stat.st_size,
+                    "archived_to": str(dest),
+                    "source_inode": src_stat.st_ino,
+                    "source_size": src_stat.st_size,
+                    "source_mtime": src_stat.st_mtime,
+                    "raw_order": raw_order,
+                    "generation": int(load_generation_descriptor(dest).get("generation", 0) or 0),
+                    "source_base_offset": int(load_generation_descriptor(dest).get("source_base_offset", 0) or 0),
+                    "predecessor": str(load_generation_descriptor(dest).get("predecessor") or ""),
+                    "source_system": SOURCE_SYSTEM,
+                    "last_update": ts(),
+                    "raw_archive_contract": report.get("contract", ""),
+                    "metadata_divergence_status": "metadata_only_raw_retained",
+                }
+                save_checkpoint(checkpoint)
+            return str(dest), (
+                "source_divergence_metadata_only_raw_retained("
+                f"source={report.get('source_size', 0)},raw={report.get('archive_size_before', 0)})"
+            )
         return str(dest), (
             "source_regression_raw_retained("
             f"source={report.get('source_size', 0)},raw={report.get('archive_size_before', 0)})"

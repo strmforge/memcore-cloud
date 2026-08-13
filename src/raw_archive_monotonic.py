@@ -1729,13 +1729,53 @@ def _archive_base_path(path: Path) -> Path:
     return path.with_name(match.group(1) + path.suffix)
 
 
-def _archive_segment_candidates(base: Path) -> list[Path]:
+def _is_archive_segment(path: Path, base: Path) -> bool:
+    if path == base:
+        return True
+    return bool(re.fullmatch(
+        re.escape(base.stem) + r"\.seg\d+" + re.escape(base.suffix),
+        path.name,
+    ))
+
+
+def _archive_segment_candidates(
+    base: Path,
+    *,
+    directory_cache: dict[str, dict[str, tuple[Path, ...]]] | None = None,
+) -> list[Path]:
     base = _archive_base_path(base)
     candidates = [base]
     if base.parent.exists():
-        candidates.extend(base.parent.glob(f"{base.stem}.seg*{base.suffix}"))
+        if directory_cache is None:
+            candidates.extend(
+                path
+                for path in base.parent.glob(f"{base.stem}.seg*{base.suffix}")
+                if _is_archive_segment(path, base)
+            )
+        else:
+            directory_key = os.path.normcase(os.path.abspath(base.parent))
+            index = directory_cache.get(directory_key)
+            if index is None:
+                grouped: dict[str, list[Path]] = {}
+                try:
+                    entries = (path for path in base.parent.iterdir() if path.is_file())
+                except OSError:
+                    entries = ()
+                for path in entries:
+                    archive_base = _archive_base_path(path)
+                    grouped.setdefault(os.path.normcase(archive_base.name), []).append(path)
+                index = {
+                    name: tuple(paths)
+                    for name, paths in grouped.items()
+                }
+                directory_cache[directory_key] = index
+            candidates.extend(index.get(os.path.normcase(base.name), ()))
     return sorted(
-        {path for path in candidates if path.is_file()},
+        {
+            path
+            for path in candidates
+            if _is_archive_segment(path, base) and path.is_file()
+        },
         key=lambda path: _segment_index(path, base),
     )
 
@@ -1767,6 +1807,8 @@ def archive_generation_chain(archive_path: str | Path) -> list[dict[str, Any]]:
 def select_archive_segment_metadata_only(
     archive_path: str | Path,
     source_inode: int | None,
+    *,
+    directory_cache: dict[str, dict[str, tuple[Path, ...]]] | None = None,
 ) -> dict[str, Any]:
     """Select the best existing segment without reading source or raw bodies.
 
@@ -1775,8 +1817,9 @@ def select_archive_segment_metadata_only(
     must not perform prefix comparison. Callers must keep an unproven selection
     fail-closed instead of treating path discovery as content continuity proof.
     """
-    base = _archive_base_path(Path(archive_path).expanduser())
-    candidates = _archive_segment_candidates(base)
+    requested = Path(archive_path).expanduser()
+    base = _archive_base_path(requested)
+    candidates = _archive_segment_candidates(base, directory_cache=directory_cache)
     inode = int(source_inode or 0)
     details: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -1811,7 +1854,6 @@ def select_archive_segment_metadata_only(
         item for item in details
         if inode and item["metadata_source_inode"] == inode
     ]
-
     if blockers:
         selected = blockers[-1]
         selection_status = "generation_blocker"
@@ -1849,6 +1891,7 @@ def select_archive_segment_metadata_only(
 
     return {
         **selected,
+        "retained_archive_path": details[-1]["archive_path"] if details else base,
         "selection_status": selection_status,
         "selection_proven_by_metadata": selection_status in {
             "active_generation_descriptor",
@@ -1894,7 +1937,7 @@ def _select_archive_segment_detail(
     source_path: str | Path | None = None,
 ) -> tuple[Path, bool]:
     """Choose a segment and distinguish inode drift from content rotation."""
-    base = Path(archive_path).expanduser()
+    base = _archive_base_path(Path(archive_path).expanduser())
     inode = int(source_inode or 0)
     if not inode:
         return base, False
@@ -1903,7 +1946,7 @@ def _select_archive_segment_detail(
     active_generation = _latest_generation_candidate(base)
     if active_generation is not None:
         return active_generation, False
-    for candidate in candidates:
+    for candidate in reversed(candidates):
         if _source_inode_from_meta(candidate) == inode:
             return candidate, False
     if not base.exists():

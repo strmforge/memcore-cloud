@@ -105,6 +105,29 @@ def test_codex_fast_discovery_does_not_read_session_bodies(tmp_path, monkeypatch
     assert all(item["session_meta_body_read_performed"] is False for item in artifacts)
 
 
+def test_codex_artifact_from_path_preserves_scan_mode_positional_contract(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions, index_path, session_path = _write_codex_session(tmp_path)
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(index_path))
+
+    artifact = codex_local_connector.artifact_from_path(
+        session_path,
+        {},
+        {},
+        {},
+        "fast",
+    )
+
+    assert artifact["discovery_scan_mode"] == "fast"
+    assert artifact["session_meta_body_read_performed"] is False
+
+
 def test_codex_fast_discovery_does_not_guess_between_duplicate_raw_archives(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(SRC))
     import codex_local_connector
@@ -129,6 +152,7 @@ def test_codex_fast_discovery_does_not_guess_between_duplicate_raw_archives(tmp_
     monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
     monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
     monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+    monkeypatch.setattr(codex_local_connector, "load_checkpoint", lambda: {})
     monkeypatch.setattr(
         codex_local_connector,
         "_read_session_meta",
@@ -140,6 +164,136 @@ def test_codex_fast_discovery_does_not_guess_between_duplicate_raw_archives(tmp_
     assert artifact["raw_archive_identity_status"] == "ambiguous"
     assert artifact["raw_archive_path_hint"] == ""
     assert artifact["canonical_window_id"] == "no-cwd"
+
+
+def test_codex_fast_discovery_uses_valid_checkpoint_to_disambiguate_raw_archive(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions = tmp_path / "codex-sessions"
+    sessions.mkdir()
+    source = sessions / "rollout-2026-08-13T00-00-00-checkpoint-session.jsonl"
+    source.write_bytes(b"session body must remain unread\n")
+    memory = tmp_path / "memory"
+    archives = []
+    for computer in ("first", "second"):
+        raw = (
+            memory
+            / computer
+            / "codex"
+            / "codex_session_jsonl"
+            / "project"
+            / "checkpoint-session.jsonl"
+        )
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(b"retained raw\n")
+        archives.append(raw)
+    selected = archives[1].with_name("checkpoint-session.seg2.jsonl")
+    selected.write_bytes(b"current retained raw\n")
+    source_inode = source.stat().st_ino
+    Path(str(selected) + ".meta.json").write_text(
+        json.dumps({
+            "source_path": str(source),
+            "session_id": "checkpoint-session",
+            "source_inode": source_inode,
+        }),
+        encoding="utf-8",
+    )
+    checkpoint = {
+        codex_local_connector._checkpoint_key(str(source)): {
+            "archived_to": str(selected),
+            "source_inode": source_inode,
+        }
+    }
+    monkeypatch.setattr(codex_local_connector, "memory_root", lambda: str(memory))
+    monkeypatch.setattr(codex_local_connector, "load_checkpoint", lambda: checkpoint)
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
+    monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+    monkeypatch.setattr(
+        codex_local_connector,
+        "_read_session_meta",
+        lambda _path: (_ for _ in ()).throw(AssertionError("fast discovery read a body")),
+    )
+
+    artifact = codex_local_connector.discover_sessions(limit=0, scan_mode="fast")[0]
+
+    assert artifact["raw_archive_identity_status"] == "matched_checkpoint"
+    assert Path(artifact["raw_archive_path_hint"]) == selected
+
+
+def test_codex_fast_discovery_rejects_checkpoint_pointing_to_derived_sidecar(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions = tmp_path / "codex-sessions"
+    sessions.mkdir()
+    source = sessions / "rollout-2026-08-13T00-00-00-derived-session.jsonl"
+    source.write_bytes(b"session body must remain unread\n")
+    memory = tmp_path / "memory"
+    archives = []
+    for computer in ("first", "second"):
+        raw = memory / computer / "codex" / "codex_session_jsonl" / "project" / "derived-session.jsonl"
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(b"retained raw\n")
+        archives.append(raw)
+    derived = archives[0].with_name("derived-session.seg1.jsonl.canonical_dialogue.jsonl")
+    derived.write_bytes(b"derived data\n")
+    checkpoint = {
+        codex_local_connector._checkpoint_key(str(source)): {
+            "archived_to": str(derived),
+        }
+    }
+    monkeypatch.setattr(codex_local_connector, "memory_root", lambda: str(memory))
+    monkeypatch.setattr(codex_local_connector, "load_checkpoint", lambda: checkpoint)
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
+    monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+
+    artifact = codex_local_connector.discover_sessions(limit=0, scan_mode="fast")[0]
+
+    assert artifact["raw_archive_identity_status"] == "ambiguous"
+    assert artifact["raw_archive_path_hint"] == ""
+
+
+def test_codex_fast_discovery_rejects_checkpoint_without_matching_raw_sidecar(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(SRC))
+    import codex_local_connector
+
+    sessions = tmp_path / "codex-sessions"
+    sessions.mkdir()
+    source = sessions / "rollout-2026-08-13T00-00-00-stale-session.jsonl"
+    source.write_bytes(b"session body must remain unread\n")
+    memory = tmp_path / "memory"
+    archives = []
+    for computer in ("first", "second"):
+        raw = memory / computer / "codex" / "codex_session_jsonl" / "project" / "stale-session.jsonl"
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(b"retained raw\n")
+        archives.append(raw)
+    Path(str(archives[0]) + ".meta.json").write_text(
+        json.dumps({
+            "source_path": str(source),
+            "session_id": "stale-session",
+            "source_inode": source.stat().st_ino + 1,
+        }),
+        encoding="utf-8",
+    )
+    checkpoint = {
+        codex_local_connector._checkpoint_key(str(source)): {
+            "archived_to": str(archives[0]),
+        }
+    }
+    monkeypatch.setattr(codex_local_connector, "memory_root", lambda: str(memory))
+    monkeypatch.setattr(codex_local_connector, "load_checkpoint", lambda: checkpoint)
+    monkeypatch.setenv("CODEX_SESSIONS_DIR", str(sessions))
+    monkeypatch.setenv("CODEX_SESSION_INDEX", str(tmp_path / "missing-session-index.jsonl"))
+    monkeypatch.setenv("CODEX_STATE_DB", str(tmp_path / "missing-state.sqlite"))
+
+    artifact = codex_local_connector.discover_sessions(limit=0, scan_mode="fast")[0]
+
+    assert artifact["raw_archive_identity_status"] == "ambiguous"
+    assert artifact["raw_archive_path_hint"] == ""
 
 
 def test_codex_scan_and_p2_extract(tmp_path):
@@ -527,6 +681,49 @@ def test_codex_divergence_generation_continues_and_reanchors_canonical_dialogue(
     raw_sync = json.loads(snapshot.stdout)["raw_sync"]
     assert raw_sync["raw_archive_max_lag_bytes"] == 0
     assert raw_sync["raw_divergence_generation_active_count"] == 1
+
+
+def test_codex_larger_metadata_only_rewrite_uses_generation_without_witness(tmp_path):
+    codex_sessions, session_index, session_path = _write_codex_session(tmp_path)
+    env = _env(tmp_path, codex_sessions, session_index)
+    first_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    original_dest = Path(json.loads(first_scan.stdout)["items"][0]["dest"])
+    original_bytes = original_dest.read_bytes()
+    records = [
+        json.loads(line)
+        for line in session_path.read_text(encoding="utf-8").splitlines()
+    ]
+    records[0]["payload"]["model_provider"] = "custom-provider-longer-than-token"
+    session_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records),
+        encoding="utf-8",
+    )
+    assert session_path.stat().st_size > len(original_bytes)
+
+    second_scan = subprocess.run(
+        [sys.executable, str(SRC / "codex_local_connector.py"), "--scan"],
+        env=env,
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    item = json.loads(second_scan.stdout)["items"][0]
+    generation_dest = Path(item["dest"])
+
+    assert item["status"].startswith("generation_started")
+    assert generation_dest != original_dest
+    assert original_dest.read_bytes() == original_bytes
+    assert Path(str(generation_dest) + ".generation.json").is_file()
+    assert not Path(str(original_dest) + ".metadata-divergence.json").exists()
+    assert not Path(str(generation_dest) + ".metadata-divergence.json").exists()
 
 
 def test_codex_checkpoint_write_uses_unique_temp_path(tmp_path):
