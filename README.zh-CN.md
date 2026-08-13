@@ -155,7 +155,7 @@ capability check 不是接通证明。以后只有当我的真实问题确实依
 
 ## 直接安装
 
-2026.8.7 是当前候选版本。最新已发布版本仍是 2026.7.18；在 8.7 正式
+2026.8.13 是当前候选版本。最新已发布版本仍是 2026.7.18；在 8.13 正式
 发布前，请使用下面指向已发布 7.18 的安装地址。
 
 macOS / Linux：
@@ -268,14 +268,14 @@ Time Library的底线是：你说过的话本身就是最高事实。任何替�
 
 ## 当前候选版本
 
-当前候选版本是 **2026.8.7**。这一版强化源记录保全、有限可恢复性诊断和
+当前候选版本是 **2026.8.13**。这一版强化源记录保全、有限可恢复性诊断和
 无人值守 Guardian 任务编排，同时保留 2026.7.25 的 fail-closed、保留
 relay/provider 的 Codex MCP 配置守护器与 watcher；已发布 2026.7.18 的本机
 安装、单前门、归档保全和透明账本边界继续保留。旧 `memcore-cloud` 目录仍作为
 迁移源和卸载兜底保留，避免老用户数据丢失；本机 AI 工具接入边界、开工前
 上下文检查、记录医生、可回源召回，以及证据绑定回答路径继续保留。
 
-候选说明见 [RELEASE_NOTES_2026.8.7.md](RELEASE_NOTES_2026.8.7.md)，完整历史更新见 [UPDATE_HISTORY.md](UPDATE_HISTORY.md)，更底层变更见 [CHANGELOG.md](CHANGELOG.md)。
+候选说明见 [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md)，完整历史更新见 [UPDATE_HISTORY.md](UPDATE_HISTORY.md)，更底层变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## AI 工具入口
 

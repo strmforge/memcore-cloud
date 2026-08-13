@@ -29,6 +29,13 @@
 - Added storage-pattern and regression coverage for those fast-moving open-source agents while keeping discovery metadata-only: no chat bodies are read and no tool is promoted to complete conversation memory until a verified collector proves the native format.
 - Added a model-source chain for unfamiliar tool recognition: user-filled or env model settings first, Memcore's own optional recognition model next, shared model identity if present, OpenClaw/Hermes inherited routes after that, and local rules when no model is available.
 
+## [2026.8.13] - 2026-08-13
+
+- Consolidated the source-preserving record, recoverability, unattended
+  Guardian, and credential-shape release safeguards into the current candidate.
+- Kept public downloads pinned to the latest published 2026.7.18 assets until
+  a separate publication authorization is given.
+
 ## [2026.8.7] - 2026-08-07
 
 - Strengthened source-preserving raw archive and canonical record checks so

@@ -1,6 +1,6 @@
-# Time Library 2026.8.7
+# Time Library 2026.8.13
 
-2026.8.7 strengthens source-preserving record reliability, bounded
+2026.8.13 strengthens source-preserving record reliability, bounded
 recoverability diagnostics, and unattended Guardian task handling while
 retaining the fail-closed, relay-preserving Codex MCP guard and watcher from
 2026.7.25.
@@ -13,7 +13,7 @@ task roles use explicit runtime checks for unattended operation.
 
 ## 中文
 
-2026.8.7 强化源记录保全、有限可恢复性诊断和无人值守 Guardian 任务编排，
+2026.8.13 强化源记录保全、有限可恢复性诊断和无人值守 Guardian 任务编排，
 同时保留 2026.7.25 的 fail-closed、保留 relay/provider 的 Codex MCP 配置
 守护器与 watcher。
 

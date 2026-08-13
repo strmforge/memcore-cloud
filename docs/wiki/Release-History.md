@@ -11,7 +11,7 @@ Older highlights are kept in:
 
 See:
 
-- [RELEASE_NOTES_2026.8.7.md](../../RELEASE_NOTES_2026.8.7.md)
+- [RELEASE_NOTES_2026.8.13.md](../../RELEASE_NOTES_2026.8.13.md)
 
 ## Current Published Release
 

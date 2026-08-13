@@ -2,7 +2,7 @@
 
 ## Install
 
-2026.8.7 is the current release candidate. The latest published release is
+2026.8.13 is the current release candidate. The latest published release is
 2026.7.18; use the published 7.18 installer URLs below until this candidate is
 published.
 

@@ -44,7 +44,7 @@ def test_zhiyi_skill_package_is_platform_neutral():
     lowered = skill.lower()
     compact_skill = re.sub(r"\s+", " ", skill)
 
-    assert "version: 2026.8.7" in skill
+    assert "version: 2026.8.13" in skill
     assert "prompt_version: 6" in skill
     assert "description: >-" in skill
     assert "Use when the user refers" in skill
@@ -486,7 +486,7 @@ def test_codex_skill_status_accepts_primary_time_library_skill_and_legacy_mcp(tm
     main = codex_home / "skills" / "time-library"
     main.mkdir(parents=True)
     (main / "SKILL.md").write_text(
-        '---\nname: time-library\nversion: 2026.8.7\nprompt_version: 6\ndescription: Use when prior context matters; call time_library_recall.\n---\n',
+        '---\nname: time-library\nversion: 2026.8.13\nprompt_version: 6\ndescription: Use when prior context matters; call time_library_recall.\n---\n',
         encoding="utf-8",
     )
     (codex_home / "config.toml").write_text(
