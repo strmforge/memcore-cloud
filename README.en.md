@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="README.zh-CN.md">简体中文</a> ·
-  <a href="https://github.com/strmforge/time-library/releases">2026.8.13 candidate</a> ·
+  <a href="https://github.com/strmforge/time-library/releases/tag/v2026.8.13">2026.8.13</a> ·
   <a href="LICENSE">MIT</a>
 </p>
 
@@ -151,21 +151,19 @@ The installer adds the workflow skill where skills are supported, registers `tim
 
 ## Quick Install
 
-2026.8.13 is the current release candidate. The latest published release is
-2026.7.18; use the published 7.18 installer URLs below until this candidate is
-published.
+2026.8.13 is the current published release. Use the versioned installers below.
 
 macOS / Linux:
 
 ```bash
-curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.sh
+curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.sh
 bash time-library-install.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 
@@ -177,7 +175,7 @@ before the install:
 
 ```powershell
 $env:TIME_LIBRARY_INSTALL_DIR = "D:\Apps\time-library"
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 
@@ -271,7 +269,7 @@ Supported local AI tool entries can be connected automatically. Conversation imp
 - **Claude is handled carefully**: Claude Desktop and Claude Code CLI can both connect, but they remain separate surfaces. Official, relay, and CLI-related records keep attribution boundaries.
 - **Hermes can inspect sources itself**: Time Library can provide raw/source-ref pointers and observe native feedback, while Hermes-owned skill changes remain Hermes-owned.
 
-## Current Release Candidate: 2026.8.13
+## Current Published Release: 2026.8.13
 
 2026.8.13 strengthens source-preserving record reliability, bounded recoverability
 diagnostics, and unattended Guardian task handling while retaining the
@@ -280,7 +278,7 @@ local setup, front-door, archive, and transparency boundaries from the
 published 2026.7.18 release remain in place. Legacy `memcore-cloud` roots
 remain migration and uninstall fallbacks so existing local data is preserved.
 
-See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this candidate,
+See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this release,
 [UPDATE_HISTORY.md](UPDATE_HISTORY.md) for older highlights, and
 [CHANGELOG.md](CHANGELOG.md) for lower-level changes.
 

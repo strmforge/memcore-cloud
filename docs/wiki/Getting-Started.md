@@ -2,21 +2,19 @@
 
 ## Install
 
-2026.8.13 is the current release candidate. The latest published release is
-2026.7.18; use the published 7.18 installer URLs below until this candidate is
-published.
+2026.8.13 is the current published release. Use the versioned installers below.
 
 macOS / Linux:
 
 ```bash
-curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.sh
+curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.sh
 bash time-library-install.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 
@@ -28,7 +26,7 @@ before the install:
 
 ```powershell
 $env:TIME_LIBRARY_INSTALL_DIR = "D:\Apps\time-library"
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 

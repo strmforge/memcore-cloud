@@ -1,8 +1,8 @@
 # Memcore Cloud Update History
 
-This page keeps the longer release highlights out of the README homepage. For
-the current release candidate, see [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md);
-the latest published release remains [2026.7.18](https://github.com/strmforge/time-library/releases/tag/v2026.7.18).
+This page keeps the longer release highlights out of the README homepage. The
+current published release is [2026.8.13](https://github.com/strmforge/time-library/releases/tag/v2026.8.13);
+see [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for its release notes.
 For engineering-level changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## 中文

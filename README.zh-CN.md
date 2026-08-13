@@ -155,20 +155,19 @@ capability check 不是接通证明。以后只有当我的真实问题确实依
 
 ## 直接安装
 
-2026.8.13 是当前候选版本。最新已发布版本仍是 2026.7.18；在 8.13 正式
-发布前，请使用下面指向已发布 7.18 的安装地址。
+2026.8.13 是当前正式发布版本。请使用下面的版本化安装地址。
 
 macOS / Linux：
 
 ```bash
-curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.sh
+curl -fL -o time-library-install.sh https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.sh
 bash time-library-install.sh
 ```
 
 Windows PowerShell：
 
 ```powershell
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 
@@ -179,7 +178,7 @@ Windows 默认安装到 `%LOCALAPPDATA%\time-library`。如果要自己选安装
 
 ```powershell
 $env:TIME_LIBRARY_INSTALL_DIR = "D:\Apps\time-library"
-iwr https://github.com/strmforge/time-library/releases/download/v2026.7.18/install.ps1 -OutFile .\install.ps1
+iwr https://github.com/strmforge/time-library/releases/download/v2026.8.13/install.ps1 -OutFile .\install.ps1
 .\install.ps1
 ```
 
@@ -266,16 +265,16 @@ Time Library的底线是：你说过的话本身就是最高事实。任何替�
 
 记录医生会用一键自检展示源记录、raw 镜像、所有会话底座、记忆与经验链路是否守住；记录链路页展示的是“记录怎么被守住”，不是炫技记忆墙。
 
-## 当前候选版本
+## 当前发布版本
 
-当前候选版本是 **2026.8.13**。这一版强化源记录保全、有限可恢复性诊断和
+当前正式发布版本是 **2026.8.13**。这一版强化源记录保全、有限可恢复性诊断和
 无人值守 Guardian 任务编排，同时保留 2026.7.25 的 fail-closed、保留
-relay/provider 的 Codex MCP 配置守护器与 watcher；已发布 2026.7.18 的本机
+relay/provider 的 Codex MCP 配置守护器与 watcher；2026.7.18 已有的本机
 安装、单前门、归档保全和透明账本边界继续保留。旧 `memcore-cloud` 目录仍作为
 迁移源和卸载兜底保留，避免老用户数据丢失；本机 AI 工具接入边界、开工前
 上下文检查、记录医生、可回源召回，以及证据绑定回答路径继续保留。
 
-候选说明见 [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md)，完整历史更新见 [UPDATE_HISTORY.md](UPDATE_HISTORY.md)，更底层变更见 [CHANGELOG.md](CHANGELOG.md)。
+发布说明见 [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md)，完整历史更新见 [UPDATE_HISTORY.md](UPDATE_HISTORY.md)，更底层变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## AI 工具入口
 

@@ -305,9 +305,9 @@ def test_current_release_install_points_to_latest_published_versioned_assets():
 
     for path in public_docs:
         text = path.read_text(encoding="utf-8")
-        assert "github.com/strmforge/time-library/releases/download/v2026.7.18/" in text
+        assert "github.com/strmforge/time-library/releases/download/v2026.8.13/" in text
         if path.name in {"README.md", "README.en.md"}:
-            assert 'github.com/strmforge/time-library/releases">2026.8.13 candidate' in text
+            assert 'github.com/strmforge/time-library/releases/tag/v2026.8.13">2026.8.13' in text
         assert "bash time-library-install.sh" in text or path.name == "Getting-Started.md"
         assert ".\\install.ps1" in text
         assert "raw.githubusercontent.com/strmforge/memcore-cloud/main/install" not in text
@@ -668,10 +668,10 @@ def test_public_readme_keeps_old_release_highlights_in_history_page():
     short_zh = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
     history = (ROOT / "UPDATE_HISTORY.md").read_text(encoding="utf-8")
 
-    assert "## Current Release Candidate: 2026.8.13" in default
-    assert "## Current Release Candidate: 2026.8.13" in en
-    assert "See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this candidate" in default
-    assert "See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this candidate" in en
+    assert "## Current Published Release: 2026.8.13" in default
+    assert "## Current Published Release: 2026.8.13" in en
+    assert "See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this release" in default
+    assert "See [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md) for this release" in en
     assert "[UPDATE_HISTORY.md](UPDATE_HISTORY.md)" in default
     assert "[UPDATE_HISTORY.md](UPDATE_HISTORY.md)" in en
     assert "完整历史更新见 [UPDATE_HISTORY.md](UPDATE_HISTORY.md)" in short_zh
@@ -713,12 +713,12 @@ def test_public_docs_show_current_release_version():
     release_notes = (ROOT / "RELEASE_NOTES_2026.8.13.md").read_text(encoding="utf-8")
 
     assert "version-2026.8.13" in default
-    assert "2026.8.13 is the current release candidate" in default
+    assert "2026.8.13 is the current published release" in default
     assert "fail-closed, relay-preserving" in default
     assert "version-2026.8.13" in en
-    assert "2026.8.13 is the current release candidate" in en
+    assert "2026.8.13 is the current published release" in en
     assert "fail-closed, relay-preserving" in en
-    assert "当前候选版本是 **2026.8.13**" in short_zh
+    assert "当前正式发布版本是 **2026.8.13**" in short_zh
     assert "源记录保全" in short_zh
     assert "source-preserving record reliability" in release_notes
     assert "可恢复性诊断" in release_notes
@@ -750,7 +750,7 @@ def test_public_docs_show_current_release_version():
     assert "neutral `local_relay` handling" not in default
     assert "legacy stray-record diagnostics" not in default
     assert "公开文档、平台目录、watchlist、诊断和测试" not in short_zh
-    assert "候选说明见 [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md)" in short_zh
+    assert "发布说明见 [RELEASE_NOTES_2026.8.13.md](RELEASE_NOTES_2026.8.13.md)" in short_zh
     assert "2026.6.2 is the current published release" not in default
     assert "2026.6.2 is the current published release" not in en
     assert "2026.6.2 是当前已发布版本" not in short_zh
